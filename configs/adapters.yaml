@@ -1,0 +1,21 @@
+sweep:
+  ranks: [4, 8, 16, 32, 64]
+  domains: [code, medical, chat, math]
+  epochs: [1, 3, 10]
+
+adapters:
+  medical_rank16:
+    rank: 16
+    domain: medical
+    epochs: 3
+    hf_path: bootscoder/Llama-3-Medical-8B-SFT-LoRA
+  code_rank32:
+    rank: 32
+    domain: code
+    epochs: 3
+    hf_path: AdnanRiaz107/CodeLLAMA3-8BI-APPS
+  chat_high_rank:
+    rank: 32
+    domain: chat
+    epochs: 1
+    hf_path: grimjim/Llama-3-Instruct-Nephilim-v3-LoRA-8B

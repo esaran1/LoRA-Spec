@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lora-spec"
+version = "0.1.0"
+description = "Research infrastructure for studying LoRA effects on speculative decoding."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "LoRA-Spec Authors" }]
+dependencies = [
+  "numpy==1.26.4",
+  "pandas==2.2.2",
+  "pydantic==2.7.4",
+  "pyyaml==6.0.1",
+  "torch==2.3.1",
+  "transformers==4.41.2",
+  "peft==0.11.1",
+  "datasets==2.19.2",
+  "safetensors==0.4.3",
+  "matplotlib==3.8.4",
+  "huggingface-hub==0.23.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.2.2",
+]
+analysis = [
+  "jupyter==1.0.0",
+  "ipykernel==6.29.5",
+  "seaborn==0.13.2",
+]
+colab = [
+  "vllm==0.5.3post1",
+  "accelerate==0.31.0",
+  "jupyter==1.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from peft import PeftModel
+from safetensors.torch import load_file as load_safetensors
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+
+try:
+    from huggingface_hub import snapshot_download
+except ImportError:  # pragma: no cover - optional direct dependency in some environments
+    snapshot_download = None
+
+
+@dataclass
+class AdapterProperties:
+    frobenius_norm_sum: float
+    spectral_norm_sum: float
+    max_spectral_norm: float
+    adapted_parameter_count: int
+    adapted_parameter_fraction: float
+    layer_frobenius_norms: dict[str, float]
+    layer_spectral_norms: dict[str, float]
+    layer_weight_norm_distribution: dict[str, float]
+
+
+@dataclass
+class CalibrationDivergence:
+    kl_divergence: float
+    js_divergence: float
+    num_positions: int
+    per_prompt_kl: list[float]
+    per_prompt_js: list[float]
+
+
+def _resolve_adapter_path(adapter_path: str | Path) -> Path:
+    path = Path(adapter_path)
+    if path.exists():
+        return path
+    if snapshot_download is None:
+        raise FileNotFoundError(f"Adapter path does not exist locally: {adapter_path}")
+    downloaded = snapshot_download(repo_id=str(adapter_path), allow_patterns=["*.json", "*.bin", "*.safetensors"])
+    return Path(downloaded)
+
+
+def _find_adapter_weights(path: Path) -> Path:
+    if path.is_file():
+        return path
+    candidates = [
+        path / "adapter_model.safetensors",
+        path / "adapter_model.bin",
+        path / "pytorch_model.bin",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Could not find adapter weights inside {path}")
+
+
+def _load_state_dict(path: Path) -> dict[str, torch.Tensor]:
+    if path.suffix == ".safetensors":
+        return load_safetensors(str(path))
+    loaded = torch.load(path, map_location="cpu")
+    if isinstance(loaded, dict) and "state_dict" in loaded:
+        loaded = loaded["state_dict"]
+    if not isinstance(loaded, dict):
+        raise TypeError(f"Unsupported adapter checkpoint format at {path}")
+    return {str(k): v for k, v in loaded.items() if isinstance(v, torch.Tensor)}
+
+
+def _normalize_key(key: str, marker: str) -> str:
+    key = key.replace(f".{marker}.default.weight", "")
+    key = key.replace(f".{marker}.weight", "")
+    return key
+
+
+def load_lora_matrices(adapter_path: str | Path) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    resolved_path = _resolve_adapter_path(adapter_path)
+    state_dict = _load_state_dict(_find_adapter_weights(resolved_path))
+    matrices_a: dict[str, torch.Tensor] = {}
+    matrices_b: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if "lora_A" in key:
+            matrices_a[_normalize_key(key, "lora_A")] = value.float().cpu()
+        elif "lora_B" in key:
+            matrices_b[_normalize_key(key, "lora_B")] = value.float().cpu()
+    common_keys = sorted(set(matrices_a) & set(matrices_b))
+    if not common_keys:
+        raise ValueError(f"No LoRA A/B matrices found in adapter checkpoint at {adapter_path}")
+    return {key: (matrices_b[key], matrices_a[key]) for key in common_keys}
+
+
+def _infer_base_parameter_count(
+    base_model: str | torch.nn.Module | None,
+) -> int:
+    if base_model is None:
+        return 0
+    if isinstance(base_model, torch.nn.Module):
+        return sum(parameter.numel() for parameter in base_model.parameters())
+    model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=torch.float32)
+    try:
+        return sum(parameter.numel() for parameter in model.parameters())
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def compute_adapter_properties(
+    adapter_path: str | Path,
+    base_model: str | torch.nn.Module | None = None,
+) -> AdapterProperties:
+    matrices = load_lora_matrices(adapter_path)
+    layer_frobenius_norms: dict[str, float] = {}
+    layer_spectral_norms: dict[str, float] = {}
+    layer_weight_norm_distribution: dict[str, float] = {}
+    adapted_parameter_count = 0
+
+    for layer_name, (matrix_b, matrix_a) in matrices.items():
+        product = matrix_b @ matrix_a
+        adapted_parameter_count += matrix_b.numel() + matrix_a.numel()
+        fro_value = float(torch.linalg.matrix_norm(product, ord="fro").item())
+        spectral_value = float(torch.linalg.matrix_norm(product, ord=2).item())
+        weight_norm = float(product.norm().item() / max(product.numel(), 1))
+        layer_frobenius_norms[layer_name] = fro_value
+        layer_spectral_norms[layer_name] = spectral_value
+        layer_weight_norm_distribution[layer_name] = weight_norm
+
+    base_parameter_count = _infer_base_parameter_count(base_model)
+    fraction = (
+        adapted_parameter_count / base_parameter_count
+        if base_parameter_count > 0
+        else float("nan")
+    )
+    return AdapterProperties(
+        frobenius_norm_sum=float(sum(layer_frobenius_norms.values())),
+        spectral_norm_sum=float(sum(layer_spectral_norms.values())),
+        max_spectral_norm=float(max(layer_spectral_norms.values())),
+        adapted_parameter_count=adapted_parameter_count,
+        adapted_parameter_fraction=float(fraction),
+        layer_frobenius_norms=layer_frobenius_norms,
+        layer_spectral_norms=layer_spectral_norms,
+        layer_weight_norm_distribution=layer_weight_norm_distribution,
+    )
+
+
+def _resolve_model(
+    model_or_name: str | PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase | None = None,
+    adapter_path: str | None = None,
+    device: str | torch.device | None = None,
+) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    if isinstance(model_or_name, PreTrainedModel):
+        if tokenizer is None:
+            raise ValueError("Tokenizer must be supplied when passing a model instance")
+        model = model_or_name
+        tok = tokenizer
+    else:
+        tok = AutoTokenizer.from_pretrained(model_or_name, use_fast=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        model = AutoModelForCausalLM.from_pretrained(model_or_name)
+    if adapter_path:
+        model = PeftModel.from_pretrained(model, adapter_path)
+    target_device = torch.device(device) if device is not None else next(model.parameters()).device
+    model = model.to(target_device).eval()
+    return model, tok
+
+
+def _prompt_batches(prompts: Iterable[str], batch_size: int) -> Iterable[list[str]]:
+    batch: list[str] = []
+    for prompt in prompts:
+        batch.append(prompt)
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _mean_token_divergence(
+    base_logits: torch.Tensor,
+    adapted_logits: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> tuple[float, float, int]:
+    base_log_probs = F.log_softmax(base_logits[:, :-1, :], dim=-1)
+    adapted_log_probs = F.log_softmax(adapted_logits[:, :-1, :], dim=-1)
+    base_probs = base_log_probs.exp()
+    adapted_probs = adapted_log_probs.exp()
+
+    mask = attention_mask[:, 1:].bool()
+    kl = torch.sum(adapted_probs * (adapted_log_probs - base_log_probs), dim=-1)
+    midpoint = 0.5 * (adapted_probs + base_probs)
+    midpoint_log = torch.log(midpoint.clamp_min(1e-12))
+    js_left = torch.sum(adapted_probs * (adapted_log_probs - midpoint_log), dim=-1)
+    js_right = torch.sum(base_probs * (base_log_probs - midpoint_log), dim=-1)
+    js = 0.5 * (js_left + js_right)
+
+    positions = int(mask.sum().item())
+    if positions == 0:
+        return 0.0, 0.0, 0
+    kl_value = float(kl.masked_select(mask).mean().item())
+    js_value = float(js.masked_select(mask).mean().item())
+    return kl_value, js_value, positions
+
+
+@torch.inference_mode()
+def compute_distribution_divergence(
+    base_model: str | PreTrainedModel,
+    adapted_model: str | PreTrainedModel,
+    prompts: list[str],
+    tokenizer: PreTrainedTokenizerBase | None = None,
+    adapted_tokenizer: PreTrainedTokenizerBase | None = None,
+    batch_size: int = 2,
+    device: str | torch.device | None = None,
+) -> CalibrationDivergence:
+    base, base_tokenizer = _resolve_model(base_model, tokenizer=tokenizer, device=device)
+    adapted, adapted_tokenizer = _resolve_model(
+        adapted_model,
+        tokenizer=adapted_tokenizer or tokenizer,
+        device=device or next(base.parameters()).device,
+    )
+    if base_tokenizer.vocab_size != adapted_tokenizer.vocab_size:
+        raise ValueError("Base and adapted tokenizer vocabularies must match for KL/JSD comparison")
+
+    per_prompt_kl: list[float] = []
+    per_prompt_js: list[float] = []
+    total_positions = 0
+
+    for batch_prompts in _prompt_batches(prompts, batch_size):
+        encoded = base_tokenizer(
+            batch_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+        encoded = {key: value.to(next(base.parameters()).device) for key, value in encoded.items()}
+        base_outputs = base(**encoded)
+        adapted_outputs = adapted(**encoded)
+        batch_kl, batch_js, positions = _mean_token_divergence(
+            base_outputs.logits.float(),
+            adapted_outputs.logits.float(),
+            encoded["attention_mask"],
+        )
+        total_positions += positions
+        per_prompt_kl.extend([batch_kl] * len(batch_prompts))
+        per_prompt_js.extend([batch_js] * len(batch_prompts))
+
+    if not per_prompt_kl:
+        raise ValueError("Prompt set must not be empty")
+    return CalibrationDivergence(
+        kl_divergence=float(np.mean(per_prompt_kl)),
+        js_divergence=float(np.mean(per_prompt_js)),
+        num_positions=total_positions,
+        per_prompt_kl=per_prompt_kl,
+        per_prompt_js=per_prompt_js,
+    )
+
+
+def read_adapter_metadata(adapter_path: str | Path) -> dict[str, Any]:
+    resolved = _resolve_adapter_path(adapter_path)
+    metadata_path = resolved / "adapter_config.json"
+    if not metadata_path.exists():
+        return {}
+    return json.loads(metadata_path.read_text(encoding="utf-8"))

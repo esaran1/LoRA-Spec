@@ -1,0 +1,22 @@
+serving:
+  gpu_memory_utilization: 0.85
+  max_model_len: 4096
+  speculation_length: 4
+  temperature: 0.0
+  max_tokens: 128
+  top_p: 1.0
+  trust_remote_code: false
+  concurrency: 4
+  requests_per_tenant: 8
+  request_spacing_s: 0.02
+  traffic_patterns:
+    uniform:
+      request_spacing_s: 0.02
+    skewed_80_20:
+      hot_tenant_fraction: 0.2
+      hot_request_fraction: 0.8
+      request_spacing_s: 0.02
+    bursty:
+      burst_size: 4
+      burst_gap_s: 0.25
+      request_spacing_s: 0.003
