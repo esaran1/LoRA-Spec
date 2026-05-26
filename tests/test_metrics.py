@@ -6,7 +6,12 @@ import types
 import pytest
 import torch
 
-from lora_spec.metrics import AcceptanceAccumulator, collect_speculative_metrics, patch_vllm_rejection_sampler
+from lora_spec.metrics import (
+    AcceptanceAccumulator,
+    collect_speculative_metrics,
+    patch_vllm_rejection_sampler,
+    simulate_speculative_decoding,
+)
 
 
 def test_acceptance_accumulator_accounts_for_bonus_token() -> None:
@@ -72,3 +77,48 @@ def test_collect_speculative_metrics_infers_timing() -> None:
     assert metrics.acceptance.accepted_drafted_tokens == 2
     assert metrics.timing.total_generated_tokens == 3
     assert metrics.timing.ttft_ms == pytest.approx(50.0)
+
+
+def test_simulate_speculative_decoding_tracks_acceptance_and_bonus_tokens() -> None:
+    class DummyOutput:
+        def __init__(self, logits: torch.Tensor) -> None:
+            self.logits = logits
+
+    class TransitionModel:
+        def __init__(self, transitions: dict[int, int], vocab_size: int = 8) -> None:
+            self.transitions = transitions
+            self.vocab_size = vocab_size
+
+        def __call__(self, input_ids: torch.Tensor) -> DummyOutput:
+            logits = torch.full(
+                (input_ids.shape[0], input_ids.shape[1], self.vocab_size),
+                fill_value=-1000.0,
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+            for batch_index in range(input_ids.shape[0]):
+                for position in range(input_ids.shape[1]):
+                    token = int(input_ids[batch_index, position].item())
+                    next_token = self.transitions.get(token, 0)
+                    logits[batch_index, position, next_token] = 0.0
+            return DummyOutput(logits)
+
+    draft_model = TransitionModel({0: 1, 1: 2, 2: 3, 3: 4})
+    target_model = TransitionModel({0: 1, 1: 2, 2: 5, 5: 6, 6: 7})
+    metrics = simulate_speculative_decoding(
+        draft_model=draft_model,
+        target_model=target_model,
+        prompt_input_ids=[torch.tensor([0], dtype=torch.long)],
+        speculation_length=2,
+        max_new_tokens=4,
+        eos_token_id=None,
+        correction=None,
+    )
+
+    assert metrics.acceptance.total_drafted_tokens == 3
+    assert metrics.acceptance.accepted_drafted_tokens == 2
+    assert metrics.acceptance.bonus_tokens == 1
+    assert metrics.acceptance.per_position_acceptance_rate == [0.5, 1.0]
+    assert metrics.emitted_tokens == 4
+    assert metrics.target_model_calls == 2
+    assert metrics.tokens_per_target_call == pytest.approx(2.0)

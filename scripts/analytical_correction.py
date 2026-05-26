@@ -10,6 +10,7 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 from lora_spec.correction import DistributionOffsetCorrection, JacobianCorrection, LowRankCorrection
+from lora_spec.metrics import simulate_speculative_decoding
 from lora_spec.utils import (
     add_common_args,
     get_config_value,
@@ -26,12 +27,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", type=str, default=None)
     parser.add_argument("--adapted-model", type=str, default=None)
     parser.add_argument("--adapted-adapter-path", type=str, default=None)
+    parser.add_argument("--draft-model", type=str, default=None)
     parser.add_argument("--prompts-file", type=str, default=None)
     parser.add_argument("--eval-prompts-file", type=str, default=None)
     parser.add_argument("--low-rank-k", type=int, default=8)
     parser.add_argument("--jacobian-probe-count", type=int, default=8)
     parser.add_argument("--jacobian-max-params", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--speculation-length", type=int, default=4)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--output-dir", type=str, default="results/correction")
     return parser.parse_args()
 
@@ -66,6 +70,34 @@ def _load_adapted_model(
     if adapted_model_name:
         return AutoModelForCausalLM.from_pretrained(adapted_model_name).to(device).eval()
     raise ValueError("Either adapted_model or adapted_adapter_path must be provided")
+
+
+def _load_draft_model(
+    draft_model_name: str | None,
+    fallback_model_name: str,
+    device: torch.device,
+) -> PreTrainedModel:
+    model_name = draft_model_name or fallback_model_name
+    return AutoModelForCausalLM.from_pretrained(model_name).to(device).eval()
+
+
+def _tokenizer_is_compatible(
+    reference_tokenizer: PreTrainedTokenizerBase,
+    candidate_tokenizer: PreTrainedTokenizerBase,
+    prompts: list[str],
+) -> bool:
+    if reference_tokenizer.vocab_size != candidate_tokenizer.vocab_size:
+        return False
+    if hasattr(reference_tokenizer, "get_vocab") and hasattr(candidate_tokenizer, "get_vocab"):
+        if reference_tokenizer.get_vocab() != candidate_tokenizer.get_vocab():
+            return False
+    for prompt in prompts[: min(4, len(prompts))]:
+        if reference_tokenizer(prompt, add_special_tokens=True)["input_ids"] != candidate_tokenizer(
+            prompt,
+            add_special_tokens=True,
+        )["input_ids"]:
+            return False
+    return True
 
 
 def _batch_prompts(prompts: list[str], batch_size: int) -> list[list[str]]:
@@ -123,6 +155,41 @@ def _evaluate_against_adapted(
     }
 
 
+def _prepare_prompt_input_ids(
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: list[str],
+) -> list[torch.Tensor]:
+    encoded = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded["attention_mask"]
+    sequences: list[torch.Tensor] = []
+    for index in range(input_ids.shape[0]):
+        length = int(attention_mask[index].sum().item())
+        if length < 1:
+            continue
+        sequences.append(input_ids[index, :length].clone())
+    if not sequences:
+        raise ValueError("No valid prompt token sequences were prepared")
+    return sequences
+
+
+def _proxy_metrics_to_dict(metrics: Any) -> dict[str, Any]:
+    return {
+        "acceptance_rate_overall": metrics.acceptance.overall_acceptance_rate,
+        "acceptance_rate_per_position": metrics.acceptance.per_position_acceptance_rate,
+        "accepted_drafted_tokens": metrics.acceptance.accepted_drafted_tokens,
+        "total_drafted_tokens": metrics.acceptance.total_drafted_tokens,
+        "bonus_tokens": metrics.acceptance.bonus_tokens,
+        "speculative_steps": metrics.acceptance.speculative_steps,
+        "emitted_tokens": metrics.emitted_tokens,
+        "target_model_calls": metrics.target_model_calls,
+        "draft_model_calls": metrics.draft_model_calls,
+        "tokens_per_target_call": metrics.tokens_per_target_call,
+        "draft_tokens_per_call": metrics.draft_tokens_per_call,
+        "target_call_reduction_vs_autoregressive": metrics.target_call_reduction_vs_autoregressive,
+    }
+
+
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.verbose, "analytical_correction")
@@ -141,6 +208,8 @@ def main() -> None:
     base_model_name = str(base_model_value)
     adapted_model_name = str(adapted_model_value) if adapted_model_value else None
     adapted_adapter_path = str(adapted_adapter_path_value) if adapted_adapter_path_value else None
+    draft_model_value = get_config_value(config_data, args, "draft_model")
+    draft_model_name = str(draft_model_value) if draft_model_value else None
     prompts_file = str(prompts_file_value)
     eval_prompts_file_value = get_config_value(config_data, args, "eval_prompts_file")
     eval_prompts_file = str(eval_prompts_file_value) if eval_prompts_file_value else prompts_file
@@ -148,6 +217,8 @@ def main() -> None:
     jacobian_probe_count = int(get_config_value(config_data, args, "jacobian_probe_count"))
     jacobian_max_params = int(get_config_value(config_data, args, "jacobian_max_params"))
     batch_size = int(get_config_value(config_data, args, "batch_size"))
+    speculation_length = int(get_config_value(config_data, args, "speculation_length"))
+    max_new_tokens = int(get_config_value(config_data, args, "max_new_tokens"))
     output_dir = str(get_config_value(config_data, args, "output_dir"))
 
     calibration_prompts = _load_prompts(prompts_file)
@@ -162,6 +233,12 @@ def main() -> None:
         adapted_adapter_path=adapted_adapter_path,
         device=device,
     )
+    draft_model = _load_draft_model(draft_model_name=draft_model_name, fallback_model_name=base_model_name, device=device)
+    draft_tokenizer = AutoTokenizer.from_pretrained(draft_model_name or base_model_name, use_fast=True)
+    if draft_tokenizer.pad_token is None:
+        draft_tokenizer.pad_token = draft_tokenizer.eos_token
+    if not _tokenizer_is_compatible(tokenizer, draft_tokenizer, calibration_prompts + eval_prompts):
+        raise ValueError("Draft tokenizer must be tokenization-compatible with the base/adapted tokenizer")
 
     logger.info("Calibrating correction baselines on %d prompts", len(calibration_prompts))
     offset = DistributionOffsetCorrection().calibrate(
@@ -220,16 +297,72 @@ def main() -> None:
         prompts=eval_prompts,
         batch_size=batch_size,
     )
+    logger.info(
+        "Simulating speculative decoding acceptance recovery on %d prompts",
+        len(eval_prompts),
+    )
+    prompt_input_ids = [sequence.to(device) for sequence in _prepare_prompt_input_ids(tokenizer, eval_prompts)]
+    baseline_proxy = simulate_speculative_decoding(
+        draft_model=draft_model,
+        target_model=adapted_model,
+        prompt_input_ids=prompt_input_ids,
+        speculation_length=speculation_length,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id,
+        correction=None,
+    )
+    offset_proxy = simulate_speculative_decoding(
+        draft_model=draft_model,
+        target_model=adapted_model,
+        prompt_input_ids=prompt_input_ids,
+        speculation_length=speculation_length,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id,
+        correction=offset,
+    )
+    low_rank_proxy = simulate_speculative_decoding(
+        draft_model=draft_model,
+        target_model=adapted_model,
+        prompt_input_ids=prompt_input_ids,
+        speculation_length=speculation_length,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id,
+        correction=low_rank,
+    )
+    jacobian_proxy = simulate_speculative_decoding(
+        draft_model=draft_model,
+        target_model=adapted_model,
+        prompt_input_ids=prompt_input_ids,
+        speculation_length=speculation_length,
+        max_new_tokens=max_new_tokens,
+        eos_token_id=tokenizer.eos_token_id,
+        correction=jacobian,
+    )
 
     payload = {
         "baseline": baseline_metrics,
         "distribution_offset": offset_metrics,
         "low_rank": low_rank_metrics,
         "jacobian": jacobian_metrics,
+        "speculative_proxy": {
+            "baseline": _proxy_metrics_to_dict(baseline_proxy),
+            "distribution_offset": _proxy_metrics_to_dict(offset_proxy),
+            "low_rank": _proxy_metrics_to_dict(low_rank_proxy),
+            "jacobian": _proxy_metrics_to_dict(jacobian_proxy),
+        },
         "improvements": {
             "distribution_offset_kl_reduction": baseline_metrics["kl_divergence"] - offset_metrics["kl_divergence"],
             "low_rank_kl_reduction": baseline_metrics["kl_divergence"] - low_rank_metrics["kl_divergence"],
             "jacobian_kl_reduction": baseline_metrics["kl_divergence"] - jacobian_metrics["kl_divergence"],
+            "distribution_offset_acceptance_recovery": (
+                offset_proxy.acceptance.overall_acceptance_rate - baseline_proxy.acceptance.overall_acceptance_rate
+            ),
+            "low_rank_acceptance_recovery": (
+                low_rank_proxy.acceptance.overall_acceptance_rate - baseline_proxy.acceptance.overall_acceptance_rate
+            ),
+            "jacobian_acceptance_recovery": (
+                jacobian_proxy.acceptance.overall_acceptance_rate - baseline_proxy.acceptance.overall_acceptance_rate
+            ),
         },
     }
     output = write_json_result(
@@ -240,12 +373,15 @@ def main() -> None:
             "base_model": base_model_name,
             "adapted_model": adapted_model_name,
             "adapted_adapter_path": adapted_adapter_path,
+            "draft_model": draft_model_name,
             "prompts_file": prompts_file,
             "eval_prompts_file": eval_prompts_file,
             "low_rank_k": low_rank_k,
             "jacobian_probe_count": jacobian_probe_count,
             "jacobian_max_params": jacobian_max_params,
             "batch_size": batch_size,
+            "speculation_length": speculation_length,
+            "max_new_tokens": max_new_tokens,
         },
         cwd=Path.cwd(),
     )

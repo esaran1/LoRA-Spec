@@ -3,6 +3,28 @@ sweep:
   domains: [code, medical, chat, math]
   epochs: [1, 3, 10]
 
+experiments:
+  - model_pair: llama3_8b_1b
+    adapter: medical_rank16
+    notes: Phase 1 validation anchor on Llama 3 8B/1B medical adaptation.
+    tags: [phase1, llama3, medical]
+  - model_pair: llama3_8b_1b
+    adapter: code_rank32
+    notes: Code-domain degradation check on the same Llama 3 serving pair.
+    tags: [phase2, llama3, code]
+  - model_pair: llama3_8b_1b
+    adapter: chat_high_rank
+    notes: Higher-rank chat adapter for rank sensitivity checks.
+    tags: [phase2, llama3, chat]
+  - model_pair: qwen25_7b_05b
+    adapter: code_rank32
+    notes: Cross-family comparison on a smaller Qwen pair.
+    tags: [phase2, qwen, code]
+  - model_pair: qwen25_7b_05b
+    adapter: medical_rank16
+    notes: Cross-family medical comparison on Qwen 7B/0.5B.
+    tags: [phase2, qwen, medical]
+
 adapters:
   medical_rank16:
     rank: 16

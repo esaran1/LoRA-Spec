@@ -80,6 +80,45 @@ python scripts/benchmark_serving.py \
   --verbose
 ```
 
+## Characterization Sweeps
+
+`configs/adapters.yaml` now supports an explicit `experiments:` manifest in addition to adapter definitions. The sweep runner writes one JSON artifact per run under `results/characterize/runs/` and can resume without rerunning completed combinations.
+
+```bash
+python scripts/characterize.py \
+  --models-config configs/models.yaml \
+  --adapters-config configs/adapters.yaml \
+  --resume \
+  --verbose
+```
+
+Useful filters can be passed through config overrides, for example:
+
+```bash
+python scripts/characterize.py \
+  --override selected_model=llama3_8b_1b \
+  --override selected_domain=medical \
+  --resume \
+  --verbose
+```
+
+## Plotting Results
+
+The plotting pipeline discovers JSON artifacts across phases and generates paper-oriented figures for:
+
+- Phase 1 baseline vs adapted comparison
+- Characterization rank trends and per-position acceptance
+- Predictive model LOOCV scatter plots
+- Analytical correction KL/JSD comparisons and speculative-acceptance recovery proxies
+- Serving throughput and p95 latency by traffic pattern
+
+```bash
+python scripts/plot_results.py \
+  --input-dir results \
+  --output-dir results/plots \
+  --verbose
+```
+
 ## Colab Notebook
 
 Open [notebooks/01_hypothesis_check.ipynb](/Users/Evan/nvidiaresearch/LoRA-Spec/notebooks/01_hypothesis_check.ipynb). The notebook installs dependencies, authenticates to Hugging Face, downloads the gated Llama 3 base models plus public LoRA adapters, runs the hypothesis check, and plots the acceptance and throughput comparison inline.

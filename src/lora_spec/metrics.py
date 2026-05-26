@@ -34,6 +34,17 @@ class SpeculativeDecodingMetrics:
     raw_decisions: list[list[bool]] = field(default_factory=list)
 
 
+@dataclass
+class SpeculativeDecodingProxyMetrics:
+    acceptance: AcceptanceMetrics
+    emitted_tokens: int
+    target_model_calls: int
+    draft_model_calls: int
+    tokens_per_target_call: float
+    draft_tokens_per_call: float
+    target_call_reduction_vs_autoregressive: float
+
+
 class AcceptanceAccumulator:
     def __init__(self, speculation_length: int | None = None) -> None:
         self.speculation_length = speculation_length
@@ -237,4 +248,116 @@ def collect_speculative_metrics(
         acceptance=acceptance,
         timing=timing,
         raw_decisions=accumulator.raw_decisions,
+    )
+
+
+def _next_token_logits(model: Any, input_ids: torch.Tensor) -> torch.Tensor:
+    outputs = model(input_ids=input_ids)
+    logits = getattr(outputs, "logits", None)
+    if logits is None:
+        raise ValueError("Model outputs must expose a logits tensor")
+    return logits[:, -1, :].float()
+
+
+def _greedy_token(logits: torch.Tensor) -> torch.Tensor:
+    return torch.argmax(logits, dim=-1)
+
+
+@torch.inference_mode()
+def simulate_speculative_decoding(
+    draft_model: Any,
+    target_model: Any,
+    prompt_input_ids: list[torch.Tensor],
+    speculation_length: int,
+    max_new_tokens: int,
+    eos_token_id: int | None = None,
+    correction: Any | None = None,
+) -> SpeculativeDecodingProxyMetrics:
+    accumulator = AcceptanceAccumulator(speculation_length=speculation_length)
+    emitted_tokens = 0
+    target_model_calls = 0
+    draft_model_calls = 0
+
+    for prompt_ids in prompt_input_ids:
+        context = prompt_ids.view(1, -1).clone()
+        generated_for_prompt = 0
+
+        while generated_for_prompt < max_new_tokens:
+            current_spec_length = min(speculation_length, max_new_tokens - generated_for_prompt)
+            draft_context = context
+            proposed_tokens: list[int] = []
+            for _ in range(current_spec_length):
+                draft_logits = _next_token_logits(draft_model, draft_context)
+                draft_model_calls += 1
+                if correction is not None:
+                    draft_logits = correction.apply(draft_logits)
+                next_token = int(_greedy_token(draft_logits)[0].item())
+                proposed_tokens.append(next_token)
+                next_token_tensor = torch.tensor([[next_token]], device=draft_context.device, dtype=draft_context.dtype)
+                draft_context = torch.cat([draft_context, next_token_tensor], dim=1)
+
+            if not proposed_tokens:
+                break
+
+            proposed_tensor = torch.tensor(
+                [proposed_tokens],
+                device=context.device,
+                dtype=context.dtype,
+            )
+            verification_input = torch.cat([context, proposed_tensor], dim=1)
+            target_logits = target_model(input_ids=verification_input).logits[0].float()
+            target_model_calls += 1
+
+            decisions: list[bool] = []
+            accepted_tokens: list[int] = []
+            prefix_length = context.shape[1]
+            mismatch = False
+
+            for position, proposed_token in enumerate(proposed_tokens):
+                target_next = int(torch.argmax(target_logits[prefix_length - 1 + position]).item())
+                accepted = target_next == proposed_token
+                decisions.append(accepted)
+                if accepted:
+                    accepted_tokens.append(proposed_token)
+                else:
+                    accepted_tokens.append(target_next)
+                    mismatch = True
+                    break
+
+            bonus_allowed = (not mismatch) and (generated_for_prompt + len(accepted_tokens) < max_new_tokens)
+            if bonus_allowed:
+                bonus_token = int(torch.argmax(target_logits[prefix_length - 1 + len(proposed_tokens)]).item())
+                decisions.append(True)
+                accepted_tokens.append(bonus_token)
+
+            accumulator.record(decisions)
+            if not accepted_tokens:
+                break
+
+            appended = torch.tensor(
+                [accepted_tokens],
+                device=context.device,
+                dtype=context.dtype,
+            )
+            context = torch.cat([context, appended], dim=1)
+            emitted_now = len(accepted_tokens)
+            emitted_tokens += emitted_now
+            generated_for_prompt += emitted_now
+
+            if eos_token_id is not None and accepted_tokens[-1] == eos_token_id:
+                break
+
+    acceptance = accumulator.summarize()
+    tokens_per_target_call = float(emitted_tokens / target_model_calls) if target_model_calls > 0 else 0.0
+    draft_tokens_per_call = float(emitted_tokens / draft_model_calls) if draft_model_calls > 0 else 0.0
+    autoregressive_target_calls = max(emitted_tokens, 1)
+    target_call_reduction = 1.0 - (target_model_calls / autoregressive_target_calls)
+    return SpeculativeDecodingProxyMetrics(
+        acceptance=acceptance,
+        emitted_tokens=emitted_tokens,
+        target_model_calls=target_model_calls,
+        draft_model_calls=draft_model_calls,
+        tokens_per_target_call=tokens_per_target_call,
+        draft_tokens_per_call=draft_tokens_per_call,
+        target_call_reduction_vs_autoregressive=float(target_call_reduction),
     )
