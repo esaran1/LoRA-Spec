@@ -9,6 +9,7 @@ from lora_spec.utils import (
     add_common_args,
     get_config_value,
     resolve_config,
+    set_seed,
     setup_logging,
     write_json_result,
 )
@@ -35,6 +36,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.verbose, "train_micro_lora")
+    set_seed(args.seed)
     config_data = resolve_config(args.config, args.override)
     draft_model = get_config_value(config_data, args, "draft_model")
     target_model = get_config_value(config_data, args, "target_model")

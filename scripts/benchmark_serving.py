@@ -15,7 +15,7 @@ from lora_spec.serving import (
     load_prompts,
     run_concurrent_benchmark,
 )
-from lora_spec.utils import add_common_args, get_config_value, load_yaml, resolve_config, setup_logging, write_json_result
+from lora_spec.utils import add_common_args, get_config_value, load_yaml, resolve_config, set_seed, setup_logging, write_json_result
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,6 +78,7 @@ def _resolve_adapter_paths(config_data: dict[str, Any], args: argparse.Namespace
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.verbose, "benchmark_serving")
+    set_seed(args.seed)
     config_data = resolve_config(args.config, args.override)
     serving_config = _serving_section(str(get_config_value(config_data, args, "serving_config")))
     pattern_name = str(get_config_value(config_data, args, "traffic_pattern"))
@@ -166,6 +167,12 @@ def main() -> None:
         adapted_executor = baseline_executor
     else:
         logger.info("Initializing in-process vLLM benchmark engine")
+        if traffic_config.concurrency > 1:
+            logger.warning(
+                "In-process vLLM benchmarking serializes requests inside one engine instance; "
+                "forcing concurrency=1 for non-misleading local measurements. Use --server-url for real concurrent load.",
+            )
+            traffic_config.concurrency = 1
         sampling_params = build_sampling_params(
             max_tokens=int(get_config_value(config_data, args, "max_tokens", serving_config.get("max_tokens", 128))),
             temperature=float(

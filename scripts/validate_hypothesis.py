@@ -17,6 +17,7 @@ from lora_spec.utils import (
     compute_config_hash,
     get_config_value,
     resolve_config,
+    set_seed,
     setup_logging,
     write_json_result,
 )
@@ -82,6 +83,7 @@ def hypothesis_recommendation(baseline_rate: float, adapted_rate: float, baselin
 
 
 def run_validation(experiment: ExperimentConfig, adapter_path: str | None, logger: logging.Logger) -> dict[str, Any]:
+    set_seed(experiment.seed)
     prompts = load_prompts(
         dataset_name=experiment.dataset,
         num_prompts=experiment.num_prompts,
@@ -203,6 +205,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.verbose, logger_name="validate_hypothesis")
+    set_seed(args.seed)
     config_data = resolve_config(args.config, args.override)
     experiment = build_experiment_config(args, config_data)
     adapter_path = get_config_value(config_data, args, "adapter_path")

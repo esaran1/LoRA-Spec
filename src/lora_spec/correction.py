@@ -29,6 +29,14 @@ class CalibrationBundle:
     tokenizer: PreTrainedTokenizerBase
 
 
+def _normalize_parameter_name(name: str) -> str:
+    normalized = name
+    for prefix in ("base_model.model.", "model.", "module."):
+        while normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+    return normalized
+
+
 def _load_model_and_tokenizer(
     model_or_name: str | PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase | None,
@@ -186,11 +194,15 @@ class JacobianCorrection:
         base_model: PreTrainedModel,
         adapted_model: PreTrainedModel,
     ) -> list[tuple[torch.nn.Parameter, torch.Tensor]]:
-        base_params = dict(base_model.named_parameters())
+        base_params = {
+            _normalize_parameter_name(name): parameter
+            for name, parameter in base_model.named_parameters()
+        }
         selected: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
         for name, parameter in adapted_model.named_parameters():
-            if "lora_" in name or "lm_head" in name or "layers." in name:
-                base_value = base_params.get(name)
+            normalized_name = _normalize_parameter_name(name)
+            if "lora_" in normalized_name or "lm_head" in normalized_name or "layers." in normalized_name:
+                base_value = base_params.get(normalized_name)
                 if base_value is None:
                     delta = parameter.detach().float().clone()
                 else:

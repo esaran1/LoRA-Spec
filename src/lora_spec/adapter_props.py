@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from peft import PeftModel
@@ -184,11 +183,11 @@ def _prompt_batches(prompts: Iterable[str], batch_size: int) -> Iterable[list[st
         yield batch
 
 
-def _mean_token_divergence(
+def _per_prompt_token_divergence(
     base_logits: torch.Tensor,
     adapted_logits: torch.Tensor,
     attention_mask: torch.Tensor,
-) -> tuple[float, float, int]:
+) -> tuple[list[float], list[float], int]:
     base_log_probs = F.log_softmax(base_logits[:, :-1, :], dim=-1)
     adapted_log_probs = F.log_softmax(adapted_logits[:, :-1, :], dim=-1)
     base_probs = base_log_probs.exp()
@@ -202,12 +201,18 @@ def _mean_token_divergence(
     js_right = torch.sum(base_probs * (base_log_probs - midpoint_log), dim=-1)
     js = 0.5 * (js_left + js_right)
 
-    positions = int(mask.sum().item())
-    if positions == 0:
-        return 0.0, 0.0, 0
-    kl_value = float(kl.masked_select(mask).mean().item())
-    js_value = float(js.masked_select(mask).mean().item())
-    return kl_value, js_value, positions
+    per_prompt_kl: list[float] = []
+    per_prompt_js: list[float] = []
+    total_positions = 0
+    for batch_index in range(mask.shape[0]):
+        prompt_mask = mask[batch_index]
+        positions = int(prompt_mask.sum().item())
+        if positions == 0:
+            continue
+        total_positions += positions
+        per_prompt_kl.append(float(kl[batch_index].masked_select(prompt_mask).mean().item()))
+        per_prompt_js.append(float(js[batch_index].masked_select(prompt_mask).mean().item()))
+    return per_prompt_kl, per_prompt_js, total_positions
 
 
 @torch.inference_mode()
@@ -232,6 +237,8 @@ def compute_distribution_divergence(
     per_prompt_kl: list[float] = []
     per_prompt_js: list[float] = []
     total_positions = 0
+    weighted_kl_sum = 0.0
+    weighted_js_sum = 0.0
 
     for batch_prompts in _prompt_batches(prompts, batch_size):
         encoded = base_tokenizer(
@@ -243,20 +250,27 @@ def compute_distribution_divergence(
         encoded = {key: value.to(next(base.parameters()).device) for key, value in encoded.items()}
         base_outputs = base(**encoded)
         adapted_outputs = adapted(**encoded)
-        batch_kl, batch_js, positions = _mean_token_divergence(
+        batch_prompt_kl, batch_prompt_js, positions = _per_prompt_token_divergence(
             base_outputs.logits.float(),
             adapted_outputs.logits.float(),
             encoded["attention_mask"],
         )
         total_positions += positions
-        per_prompt_kl.extend([batch_kl] * len(batch_prompts))
-        per_prompt_js.extend([batch_js] * len(batch_prompts))
+        per_prompt_kl.extend(batch_prompt_kl)
+        per_prompt_js.extend(batch_prompt_js)
+        prompt_positions = [
+            int(encoded["attention_mask"][index, 1:].sum().item())
+            for index in range(encoded["attention_mask"].shape[0])
+            if int(encoded["attention_mask"][index, 1:].sum().item()) > 0
+        ]
+        weighted_kl_sum += sum(value * prompt_count for value, prompt_count in zip(batch_prompt_kl, prompt_positions))
+        weighted_js_sum += sum(value * prompt_count for value, prompt_count in zip(batch_prompt_js, prompt_positions))
 
     if not per_prompt_kl:
         raise ValueError("Prompt set must not be empty")
     return CalibrationDivergence(
-        kl_divergence=float(np.mean(per_prompt_kl)),
-        js_divergence=float(np.mean(per_prompt_js)),
+        kl_divergence=float(weighted_kl_sum / total_positions),
+        js_divergence=float(weighted_js_sum / total_positions),
         num_positions=total_positions,
         per_prompt_kl=per_prompt_kl,
         per_prompt_js=per_prompt_js,

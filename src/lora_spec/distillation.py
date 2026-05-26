@@ -10,6 +10,8 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
+from .utils import set_seed
+
 
 @dataclass
 class DistillationConfig:
@@ -96,6 +98,29 @@ def _full_vocab_kl(
     return (token_kl * mask).sum() / mask.sum().clamp_min(1.0)
 
 
+def _tokenizers_are_compatible(
+    draft_tokenizer: PreTrainedTokenizerBase,
+    target_tokenizer: PreTrainedTokenizerBase,
+    prompts: list[str],
+) -> bool:
+    if draft_tokenizer.vocab_size != target_tokenizer.vocab_size:
+        return False
+    special_id_fields = ("pad_token_id", "eos_token_id", "bos_token_id", "unk_token_id")
+    for field in special_id_fields:
+        if getattr(draft_tokenizer, field, None) != getattr(target_tokenizer, field, None):
+            return False
+    if hasattr(draft_tokenizer, "get_vocab") and hasattr(target_tokenizer, "get_vocab"):
+        if draft_tokenizer.get_vocab() != target_tokenizer.get_vocab():
+            return False
+    probe_prompts = prompts[: min(len(prompts), 4)] or ["Compatibility probe"]
+    for prompt in probe_prompts:
+        draft_ids = draft_tokenizer(prompt, add_special_tokens=True)["input_ids"]
+        target_ids = target_tokenizer(prompt, add_special_tokens=True)["input_ids"]
+        if draft_ids != target_ids:
+            return False
+    return True
+
+
 def train_micro_lora_adapter(
     draft_model: str | PreTrainedModel,
     target_model: str | PreTrainedModel,
@@ -106,7 +131,7 @@ def train_micro_lora_adapter(
     target_tokenizer: PreTrainedTokenizerBase | None = None,
     adapter_path: str | None = None,
 ) -> Path:
-    torch.manual_seed(config.seed)
+    set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if isinstance(prompts, Dataset):
@@ -120,8 +145,11 @@ def train_micro_lora_adapter(
         target_tokenizer = target_tokenizer or _load_tokenizer(target_model)
     if draft_tokenizer is None or target_tokenizer is None:
         raise ValueError("Tokenizers must be available for both draft and target models")
-    if draft_tokenizer.vocab_size != target_tokenizer.vocab_size:
-        raise ValueError("Draft and target tokenizers must share the same vocabulary")
+    prompt_probe = list(prompts[: min(len(prompts), 4)]) if isinstance(prompts, list) else ["Compatibility probe"]
+    if not _tokenizers_are_compatible(draft_tokenizer, target_tokenizer, prompt_probe):
+        raise ValueError(
+            "Draft and target tokenizers must be tokenization-compatible for full-vocabulary KL distillation",
+        )
 
     teacher_model = _load_model(target_model, device=device).eval()
     if adapter_path is not None:
@@ -146,15 +174,13 @@ def train_micro_lora_adapter(
     for epoch in range(config.epochs):
         for prompt_batch in dataloader:
             batch = list(prompt_batch) if isinstance(prompt_batch, Iterable) else [prompt_batch]
-            encoded_student = _collate_prompts(batch, draft_tokenizer, max_length=config.max_length)
-            encoded_student = {key: tensor.to(device) for key, tensor in encoded_student.items()}
-            encoded_teacher = _collate_prompts(batch, target_tokenizer, max_length=config.max_length)
-            encoded_teacher = {key: tensor.to(device) for key, tensor in encoded_teacher.items()}
+            encoded_inputs = _collate_prompts(batch, draft_tokenizer, max_length=config.max_length)
+            encoded_inputs = {key: tensor.to(device) for key, tensor in encoded_inputs.items()}
 
             with torch.no_grad():
-                teacher_logits = teacher_model(**encoded_teacher).logits.float()
-            student_logits = student_model(**encoded_student).logits.float()
-            loss = _full_vocab_kl(student_logits, teacher_logits, encoded_student["attention_mask"])
+                teacher_logits = teacher_model(**encoded_inputs).logits.float()
+            student_logits = student_model(**encoded_inputs).logits.float()
+            loss = _full_vocab_kl(student_logits, teacher_logits, encoded_inputs["attention_mask"])
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
