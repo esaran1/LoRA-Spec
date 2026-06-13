@@ -1,43 +1,106 @@
 sweep:
-  ranks: [4, 8, 16, 32, 64]
-  domains: [code, medical, chat, math]
-  epochs: [1, 3, 10]
-
-experiments:
-  - model_pair: llama3_8b_1b
-    adapter: medical_rank16
-    notes: Phase 1 validation anchor on Llama 3 8B/1B medical adaptation.
-    tags: [phase1, llama3, medical]
-  - model_pair: llama3_8b_1b
-    adapter: code_rank32
-    notes: Code-domain degradation check on the same Llama 3 serving pair.
-    tags: [phase2, llama3, code]
-  - model_pair: llama3_8b_1b
-    adapter: chat_high_rank
-    notes: Higher-rank chat adapter for rank sensitivity checks.
-    tags: [phase2, llama3, chat]
-  - model_pair: qwen25_7b_05b
-    adapter: code_rank32
-    notes: Cross-family comparison on a smaller Qwen pair.
-    tags: [phase2, qwen, code]
-  - model_pair: qwen25_7b_05b
-    adapter: medical_rank16
-    notes: Cross-family medical comparison on Qwen 7B/0.5B.
-    tags: [phase2, qwen, medical]
+  ranks: [16, 32, 64]
+  domains: [code, medical, chat]
+  magnitude_scales: [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
 adapters:
-  medical_rank16:
-    rank: 16
+  medical_rank64_scale025: &medical025
+    rank: 64
     domain: medical
-    epochs: 3
+    epochs: null
     hf_path: bootscoder/Llama-3-Medical-8B-SFT-LoRA
-  code_rank32:
-    rank: 32
+    target_model: meta-llama/Meta-Llama-3-8B
+    magnitude_scale: 0.25
+  medical_rank64_scale050:
+    <<: *medical025
+    magnitude_scale: 0.5
+  medical_rank64_scale075:
+    <<: *medical025
+    magnitude_scale: 0.75
+  medical_rank64_scale100:
+    <<: *medical025
+    magnitude_scale: 1.0
+  medical_rank64_scale125:
+    <<: *medical025
+    magnitude_scale: 1.25
+  medical_rank64_scale150:
+    <<: *medical025
+    magnitude_scale: 1.5
+  medical_rank64_scale200:
+    <<: *medical025
+    magnitude_scale: 2.0
+
+  code_rank16_scale025: &code025
+    rank: 16
     domain: code
-    epochs: 3
+    epochs: null
     hf_path: AdnanRiaz107/CodeLLAMA3-8BI-APPS
-  chat_high_rank:
+    target_model: meta-llama/Meta-Llama-3-8B-Instruct
+    magnitude_scale: 0.25
+  code_rank16_scale050:
+    <<: *code025
+    magnitude_scale: 0.5
+  code_rank16_scale075:
+    <<: *code025
+    magnitude_scale: 0.75
+  code_rank16_scale100:
+    <<: *code025
+    magnitude_scale: 1.0
+  code_rank16_scale125:
+    <<: *code025
+    magnitude_scale: 1.25
+  code_rank16_scale150:
+    <<: *code025
+    magnitude_scale: 1.5
+  code_rank16_scale200:
+    <<: *code025
+    magnitude_scale: 2.0
+
+  chat_rank32_scale025: &chat025
     rank: 32
     domain: chat
-    epochs: 1
+    epochs: null
     hf_path: grimjim/Llama-3-Instruct-Nephilim-v3-LoRA-8B
+    target_model: grimjim/llama-3-Nephilim-v3-8B
+    magnitude_scale: 0.25
+  chat_rank32_scale050:
+    <<: *chat025
+    magnitude_scale: 0.5
+  chat_rank32_scale075:
+    <<: *chat025
+    magnitude_scale: 0.75
+  chat_rank32_scale100:
+    <<: *chat025
+    magnitude_scale: 1.0
+  chat_rank32_scale125:
+    <<: *chat025
+    magnitude_scale: 1.25
+  chat_rank32_scale150:
+    <<: *chat025
+    magnitude_scale: 1.5
+  chat_rank32_scale200:
+    <<: *chat025
+    magnitude_scale: 2.0
+
+experiments:
+  - {model_pair: llama3_8b_base_1b, adapter: medical_rank64_scale025, tags: [medical, magnitude]}
+  - {model_pair: llama3_8b_base_1b, adapter: medical_rank64_scale050, tags: [medical, magnitude]}
+  - {model_pair: llama3_8b_base_1b, adapter: medical_rank64_scale075, tags: [medical, magnitude]}
+  - {model_pair: llama3_8b_base_1b, adapter: medical_rank64_scale100, tags: [medical, anchor]}
+  - {model_pair: llama3_8b_base_1b, adapter: medical_rank64_scale125, tags: [medical, magnitude]}
+  - {model_pair: llama3_8b_base_1b, adapter: medical_rank64_scale150, tags: [medical, magnitude]}
+  - {model_pair: llama3_8b_base_1b, adapter: medical_rank64_scale200, tags: [medical, magnitude]}
+  - {model_pair: llama3_8b_1b, adapter: code_rank16_scale025, tags: [code, magnitude]}
+  - {model_pair: llama3_8b_1b, adapter: code_rank16_scale050, tags: [code, magnitude]}
+  - {model_pair: llama3_8b_1b, adapter: code_rank16_scale075, tags: [code, magnitude]}
+  - {model_pair: llama3_8b_1b, adapter: code_rank16_scale100, tags: [code, anchor]}
+  - {model_pair: llama3_8b_1b, adapter: code_rank16_scale125, tags: [code, magnitude]}
+  - {model_pair: llama3_8b_1b, adapter: code_rank16_scale150, tags: [code, magnitude]}
+  - {model_pair: llama3_8b_1b, adapter: code_rank16_scale200, tags: [code, magnitude]}
+  - {model_pair: llama3_nephilim_8b_1b, adapter: chat_rank32_scale025, tags: [chat, magnitude]}
+  - {model_pair: llama3_nephilim_8b_1b, adapter: chat_rank32_scale050, tags: [chat, magnitude]}
+  - {model_pair: llama3_nephilim_8b_1b, adapter: chat_rank32_scale075, tags: [chat, magnitude]}
+  - {model_pair: llama3_nephilim_8b_1b, adapter: chat_rank32_scale100, tags: [chat, anchor]}
+  - {model_pair: llama3_nephilim_8b_1b, adapter: chat_rank32_scale125, tags: [chat, magnitude]}
+  - {model_pair: llama3_nephilim_8b_1b, adapter: chat_rank32_scale150, tags: [chat, magnitude]}
+  - {model_pair: llama3_nephilim_8b_1b, adapter: chat_rank32_scale200, tags: [chat, magnitude]}

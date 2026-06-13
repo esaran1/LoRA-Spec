@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 from pathlib import Path
 from typing import Any
 
+from lora_spec.adapter_props import read_adapter_metadata
 from lora_spec.config import AdapterConfig, ExperimentConfig, ModelPairConfig, ResultRecord
 from lora_spec.serving import (
     build_sampling_params,
@@ -38,11 +40,26 @@ def build_experiment_config(args: argparse.Namespace, config_data: dict[str, Any
     )
     adapter = None
     if adapter_path:
+        adapter_metadata = read_adapter_metadata(str(adapter_path))
+        configured_rank = config_data.get("adapter_rank", args.adapter_rank)
+        metadata_rank = adapter_metadata.get("r")
+        if configured_rank is None and metadata_rank is None:
+            raise ValueError("Adapter rank is absent from both CLI/config and adapter_config.json")
+        adapter_rank = int(configured_rank if configured_rank is not None else metadata_rank)
+        if metadata_rank is not None and adapter_rank != int(metadata_rank):
+            raise ValueError(
+                f"Configured adapter rank {adapter_rank} does not match checkpoint metadata rank {metadata_rank}"
+            )
+        metadata_base = adapter_metadata.get("base_model_name_or_path")
+        if isinstance(metadata_base, str) and metadata_base and not metadata_base.startswith("/"):
+            if metadata_base != str(target_model):
+                raise ValueError(f"Adapter targets {metadata_base}, but target_model is {target_model}")
         adapter = AdapterConfig(
-            rank=int(config_data.get("adapter_rank", args.adapter_rank or 1)),
+            rank=adapter_rank,
             domain=str(config_data.get("adapter_domain", args.adapter_domain or "unknown")),
-            epochs=int(config_data.get("adapter_epochs", args.adapter_epochs or 1)),
+            epochs=config_data.get("adapter_epochs", args.adapter_epochs),
             hf_path=str(adapter_path),
+            target_model=str(target_model),
         )
     return ExperimentConfig(
         model_pair=model_pair,
@@ -52,6 +69,8 @@ def build_experiment_config(args: argparse.Namespace, config_data: dict[str, Any
         seed=int(config_data.get("seed", args.seed)),
         speculation_length=int(config_data.get("speculation_length", args.speculation_length)),
         max_tokens=int(config_data.get("max_tokens", args.max_tokens)),
+        warmup_prompts=int(config_data.get("warmup_prompts", args.warmup_prompts)),
+        warmup_tokens=int(config_data.get("warmup_tokens", args.warmup_tokens)),
         gpu_memory_utilization=float(
             config_data.get("gpu_memory_utilization", args.gpu_memory_utilization),
         ),
@@ -64,6 +83,13 @@ def make_result_record(
     config_hash: str,
     metadata: dict[str, Any],
 ) -> ResultRecord:
+    metadata = {
+        **metadata,
+        "acceptance_instrumentation_backend": metrics.instrumentation_backend,
+        "accepted_drafted_tokens": metrics.acceptance.accepted_drafted_tokens,
+        "total_drafted_tokens": metrics.acceptance.total_drafted_tokens,
+        "bonus_tokens": metrics.acceptance.bonus_tokens,
+    }
     return ResultRecord(
         config_hash=config_hash,
         acceptance_rate_overall=metrics.acceptance.overall_acceptance_rate,
@@ -99,27 +125,43 @@ def run_validation(experiment: ExperimentConfig, adapter_path: str | None, logge
         trust_remote_code=experiment.trust_remote_code,
     )
     sampling_params = build_sampling_params(max_tokens=experiment.max_tokens)
+    warmup_sampling_params = build_sampling_params(max_tokens=experiment.warmup_tokens)
     config_hash = compute_config_hash(experiment)
-
-    logger.info("Running baseline speculative decoding without LoRA")
-    baseline = run_speculative_generation(
-        llm=llm,
-        prompts=prompts,
-        sampling_params=sampling_params,
-        speculation_length=experiment.speculation_length,
-    )
 
     if adapter_path is None:
         raise ValueError("adapter_path must be provided for hypothesis validation")
 
-    logger.info("Running adapted speculative decoding with LoRA adapter %s", adapter_path)
-    adapted = run_speculative_generation(
+    warmup_prompts = prompts[: min(experiment.warmup_prompts, len(prompts))]
+    logger.info("Warming baseline and adapted conditions on %d prompts", len(warmup_prompts))
+    run_speculative_generation(
         llm=llm,
-        prompts=prompts,
-        sampling_params=sampling_params,
+        prompts=warmup_prompts,
+        sampling_params=warmup_sampling_params,
+        speculation_length=experiment.speculation_length,
+    )
+    run_speculative_generation(
+        llm=llm,
+        prompts=warmup_prompts,
+        sampling_params=warmup_sampling_params,
         speculation_length=experiment.speculation_length,
         adapter_path=adapter_path,
     )
+
+    condition_order = ["baseline", "adapted"]
+    random.Random(experiment.seed).shuffle(condition_order)
+    measured_runs: dict[str, Any] = {}
+    for condition in condition_order:
+        condition_adapter = adapter_path if condition == "adapted" else None
+        logger.info("Running measured %s condition", condition)
+        measured_runs[condition] = run_speculative_generation(
+            llm=llm,
+            prompts=prompts,
+            sampling_params=sampling_params,
+            speculation_length=experiment.speculation_length,
+            adapter_path=condition_adapter,
+        )
+    baseline = measured_runs["baseline"]
+    adapted = measured_runs["adapted"]
 
     acceptance_delta = (
         adapted.metrics.acceptance.overall_acceptance_rate
@@ -169,6 +211,9 @@ def run_validation(experiment: ExperimentConfig, adapter_path: str | None, logge
             "acceptance_delta": acceptance_delta,
             "throughput_delta_tps": throughput_delta,
             "recommendation": recommendation,
+            "measured_condition_order": condition_order,
+            "warmup_prompts": len(warmup_prompts),
+            "warmup_tokens": experiment.warmup_tokens,
         },
     }
     return {
@@ -197,6 +242,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-degree", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--warmup-prompts", type=int, default=2)
+    parser.add_argument("--warmup-tokens", type=int, default=8)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results/phase1")
     return parser.parse_args()

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import json
 
 pytest.importorskip("safetensors")
 pytest.importorskip("transformers")
@@ -79,15 +80,20 @@ def test_load_lora_matrices_and_compute_properties(tmp_path: Path) -> None:
         },
         str(adapter_dir / "adapter_model.safetensors"),
     )
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps({"r": 2, "lora_alpha": 4, "use_rslora": False}),
+        encoding="utf-8",
+    )
     matrices = load_lora_matrices(adapter_dir)
     assert set(matrices) == {"layer0", "layer1"}
 
     base_model = torch.nn.Linear(2, 2, bias=False)
     properties = compute_adapter_properties(adapter_dir, base_model=base_model)
     assert properties.adapted_parameter_count == 10
-    assert properties.frobenius_norm_sum == pytest.approx(9.0710678118, rel=1e-5)
-    assert properties.max_spectral_norm == pytest.approx(5.0, rel=1e-5)
-    assert properties.layer_frobenius_norms["layer0"] == pytest.approx(2.8284271247, rel=1e-5)
+    assert properties.frobenius_norm_sum == pytest.approx(18.1421356237, rel=1e-5)
+    assert properties.max_spectral_norm == pytest.approx(10.0, rel=1e-5)
+    assert properties.layer_frobenius_norms["layer0"] == pytest.approx(5.6568542495, rel=1e-5)
+    assert properties.layer_scalings == {"layer0": 2.0, "layer1": 2.0}
     assert properties.adapted_parameter_fraction == pytest.approx(2.5)
 
 

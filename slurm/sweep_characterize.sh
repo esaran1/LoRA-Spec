@@ -24,8 +24,8 @@ echo "cuda=$(python -c 'import torch; print(torch.version.cuda or \"unknown\")')
 python --version
 nvidia-smi
 
-MODEL_KEYS=("llama3_8b_1b" "llama3_8b_1b" "qwen25_7b_05b")
-ADAPTER_KEYS=("medical_rank16" "chat_high_rank" "code_rank32")
+MODEL_KEYS=("llama3_8b_base_1b" "llama3_nephilim_8b_1b" "llama3_8b_1b")
+ADAPTER_KEYS=("medical_rank64_scale100" "chat_rank32_scale100" "code_rank16_scale100")
 
 MODEL_KEY="${MODEL_KEYS[$SLURM_ARRAY_TASK_ID]}"
 ADAPTER_KEY="${ADAPTER_KEYS[$SLURM_ARRAY_TASK_ID]}"

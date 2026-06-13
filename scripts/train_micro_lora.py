@@ -28,6 +28,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--torch-dtype", type=str, default="auto")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--output-dir", type=str, default="checkpoints/micro_lora")
     parser.add_argument("--results-dir", type=str, default="results/distillation")
     return parser.parse_args()
@@ -56,6 +59,11 @@ def main() -> None:
         epochs=int(get_config_value(config_data, args, "epochs")),
         max_length=int(get_config_value(config_data, args, "max_length")),
         seed=args.seed,
+        torch_dtype=str(get_config_value(config_data, args, "torch_dtype")),
+        gradient_accumulation_steps=int(
+            get_config_value(config_data, args, "gradient_accumulation_steps")
+        ),
+        max_grad_norm=float(get_config_value(config_data, args, "max_grad_norm")),
     )
     checkpoint = train_micro_lora_adapter(
         draft_model=draft_model,

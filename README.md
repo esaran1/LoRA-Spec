@@ -1,17 +1,22 @@
 # LoRA-Spec
 
-LoRA-Spec studies how LoRA adaptation degrades speculative decoding acceptance rates in multi-tenant LLM serving. The central hypothesis is that speculative decoding works because the draft model is aligned to the base target distribution, but a LoRA adapter shifts the target distribution enough that the draft model's proposals get rejected more often and throughput falls.
+LoRA-Spec studies speculative decoding under LoRA adaptation from a theory-first perspective. The central object is the adapter-induced next-token logit shift
 
-## Research Scope
+`delta_z(x) = z_adapted(x) - z_base(x)`.
 
-The repository is structured around six phases:
+Because LoRA is a low-rank weight perturbation, `W' = W + BA`, the project tests whether `delta_z(x)` is approximately low-rank in practice. LoRA rank alone does not imply a hard rank bound on the cross-context logit-shift matrix because the model Jacobian varies with context.
 
-1. Phase 1 hypothesis validation on a single target and draft pair with a public LoRA adapter.
-2. Phase 2 characterization across model pairs, LoRA ranks, domains, and fine-tuning intensity.
-3. Phase 3 predictive modeling from adapter properties.
-4. Phase 4 analytical correction methods.
-5. Phase 5 micro-LoRA distillation on the draft model.
-6. Phase 6 multi-tenant serving benchmarks under uniform, skewed, and bursty traffic.
+## Research Spine
+
+The repository supports three core claims:
+
+1. Determine when the empirical logit-shift matrix is low-rank or near-low-rank.
+2. Evaluate a PCA-output-subspace ridge operator whose calibration residual decomposes into spectral-tail and coefficient-regression terms.
+3. There is a phase boundary where the shift becomes too nonlinear or too large for analytical correction, and training becomes necessary.
+
+System benchmarks remain in the repo, but they now validate the theoretical story rather than define it.
+
+All logit-space rank results use a row-mean-centered gauge because softmax distributions are invariant to a per-context scalar offset. Correction operators are calibrated on `adapted target - base target`; draft outputs are application-time features, not part of the adapter-shift definition.
 
 ## Setup
 
@@ -28,89 +33,66 @@ For Colab Pro or GPU experiments with vLLM:
 pip install -e .[analysis,colab]
 ```
 
-## Repository Layout
+## Main Theory Experiments
 
-- `src/lora_spec/`: core library code.
-- `scripts/`: experiment entry points for each phase.
-- `configs/`: model, adapter, and serving benchmark definitions.
-- `notebooks/01_hypothesis_check.ipynb`: Colab-ready Phase 1 notebook.
-- `slurm/`: cluster launch templates for 8B, 70B, distillation, and serving runs.
-- `tests/`: CPU-only synthetic tests.
-- `research_log/log.md`: experiment log template.
-
-## Reproducing Phase 1
+Measure effective rank of the logit-shift matrix:
 
 ```bash
-python scripts/validate_hypothesis.py \
-  --target-model meta-llama/Meta-Llama-3-8B-Instruct \
-  --draft-model meta-llama/Meta-Llama-3-1B-Instruct \
-  --adapter-path bootscoder/Llama-3-Medical-8B-SFT-LoRA \
-  --adapter-rank 16 \
-  --adapter-domain medical \
-  --adapter-epochs 3 \
-  --dataset tatsu-lab/alpaca \
-  --num-prompts 32 \
-  --speculation-length 4 \
-  --gpu-memory-utilization 0.85 \
-  --verbose
-```
-
-Results are written to `results/phase1/` with timestamp, config hash, git hash, and full config.
-
-## Multi-Tenant Serving Benchmark
-
-The serving benchmark supports:
-
-- `uniform` request distribution across tenants.
-- `skewed_80_20` demand concentration where 20% of tenants receive 80% of requests.
-- `bursty` arrivals for concurrency spikes.
-
-Example:
-
-```bash
-python scripts/benchmark_serving.py \
-  --target-model meta-llama/Meta-Llama-3-8B-Instruct \
-  --draft-model meta-llama/Meta-Llama-3-1B-Instruct \
-  --adapter-path bootscoder/Llama-3-Medical-8B-SFT-LoRA \
-  --adapter-path grimjim/Llama-3-Instruct-Nephilim-v3-LoRA-8B \
-  --traffic-pattern skewed_80_20 \
-  --concurrency 4 \
-  --requests-per-tenant 8 \
-  --num-prompts 128 \
-  --verbose
-```
-
-## Characterization Sweeps
-
-`configs/adapters.yaml` now supports an explicit `experiments:` manifest in addition to adapter definitions. The sweep runner writes one JSON artifact per run under `results/characterize/runs/` and can resume without rerunning completed combinations.
-
-```bash
-python scripts/characterize.py \
+python scripts/measure_logit_shift_rank.py \
   --models-config configs/models.yaml \
   --adapters-config configs/adapters.yaml \
-  --resume \
+  --model-pair llama3_8b_1b \
+  --prompts-file data/calibration_prompts.txt \
   --verbose
 ```
 
-Useful filters can be passed through config overrides, for example:
+Validate the exact rejection-sampling overlap identity and the residual-logit lower bound against held-out acceptance:
 
 ```bash
-python scripts/characterize.py \
-  --override selected_model=llama3_8b_1b \
-  --override selected_domain=medical \
-  --resume \
+python scripts/validate_correction_theory.py \
+  --base-model meta-llama/Meta-Llama-3-8B-Instruct \
+  --draft-model meta-llama/Llama-3.2-1B-Instruct \
+  --adapted-adapter-path AdnanRiaz107/CodeLLAMA3-8BI-APPS \
+  --prompts-file data/calibration_prompts.txt \
+  --eval-prompts-file data/eval_prompts.txt \
+  --rank-values 0,1,2,4,8,16 \
   --verbose
 ```
 
-## Plotting Results
+Sweep adapter magnitude for phase-transition analysis:
 
-The plotting pipeline discovers JSON artifacts across phases and generates paper-oriented figures for:
+```bash
+python scripts/phase_transition_sweep.py \
+  --base-model meta-llama/Meta-Llama-3-8B-Instruct \
+  --draft-model meta-llama/Llama-3.2-1B-Instruct \
+  --adapter-path AdnanRiaz107/CodeLLAMA3-8BI-APPS \
+  --prompts-file data/calibration_prompts.txt \
+  --eval-prompts-file data/eval_prompts.txt \
+  --verbose
+```
 
-- Phase 1 baseline vs adapted comparison
-- Characterization rank trends and per-position acceptance
-- Predictive model LOOCV scatter plots
-- Analytical correction KL/JSD comparisons and speculative-acceptance recovery proxies
-- Serving throughput and p95 latency by traffic pattern
+Measure shared dominant subspaces across adapters:
+
+```bash
+python scripts/subspace_sharing.py \
+  --models-config configs/models.yaml \
+  --adapters-config configs/adapters.yaml \
+  --model-pair llama3_8b_1b \
+  --prompts-file data/calibration_prompts.txt \
+  --verbose
+```
+
+## Existing System-Facing Experiments
+
+- `scripts/validate_hypothesis.py`: initial degradation check under speculative decoding
+- `scripts/characterize.py`: broader degradation characterization
+- `scripts/analytical_correction.py`: single-run correction evaluation with theory-grounded operators
+- `scripts/train_micro_lora.py`: training-based upper bound when analytical correction breaks down
+- `scripts/benchmark_serving.py`: multi-tenant serving experiments
+
+## Plotting
+
+Generate figures from JSON artifacts across theory and systems phases:
 
 ```bash
 python scripts/plot_results.py \
@@ -119,6 +101,13 @@ python scripts/plot_results.py \
   --verbose
 ```
 
-## Colab Notebook
+## Configs
 
-Open [notebooks/01_hypothesis_check.ipynb](/Users/Evan/nvidiaresearch/LoRA-Spec/notebooks/01_hypothesis_check.ipynb). The notebook installs dependencies, authenticates to Hugging Face, downloads the gated Llama 3 base models plus public LoRA adapters, runs the hypothesis check, and plots the acceptance and throughput comparison inline.
+- `configs/models.yaml`: model-pair definitions, including a third family beyond Llama and Qwen
+- `configs/adapters.yaml`: adapter manifests with explicit magnitude sweeps
+- `configs/baselines.yaml`: decoding, analytical, and training-based baselines
+- `configs/serving.yaml`: traffic-pattern settings for serving benchmarks
+
+## Artifact Reproduction
+
+See [ARTIFACT.md](ARTIFACT.md) for figure-by-figure reproduction commands.

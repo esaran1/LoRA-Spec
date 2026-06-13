@@ -23,8 +23,8 @@ python --version
 nvidia-smi
 
 python scripts/train_micro_lora.py \
-  --draft-model meta-llama/Meta-Llama-3-1B-Instruct \
-  --target-model meta-llama/Meta-Llama-3-8B-Instruct \
+  --draft-model meta-llama/Llama-3.2-1B-Instruct \
+  --target-model meta-llama/Meta-Llama-3-8B \
   --target-adapter-path bootscoder/Llama-3-Medical-8B-SFT-LoRA \
   --dataset tatsu-lab/alpaca \
   --num-prompts 512 \

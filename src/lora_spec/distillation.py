@@ -10,7 +10,7 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
-from .utils import set_seed
+from .utils import resolve_torch_dtype, set_seed
 
 
 @dataclass
@@ -22,6 +22,9 @@ class DistillationConfig:
     max_length: int = 512
     save_every_epoch: bool = True
     seed: int = 7
+    torch_dtype: str = "auto"
+    gradient_accumulation_steps: int = 1
+    max_grad_norm: float = 1.0
 
 
 class PromptDataset(Dataset):
@@ -45,10 +48,15 @@ def _load_tokenizer(model_name: str) -> PreTrainedTokenizerBase:
 def _load_model(
     model_or_name: str | PreTrainedModel,
     device: str | torch.device,
+    torch_dtype: torch.dtype,
 ) -> PreTrainedModel:
     if isinstance(model_or_name, PreTrainedModel):
         return model_or_name.to(device)
-    return AutoModelForCausalLM.from_pretrained(model_or_name).to(device)
+    return AutoModelForCausalLM.from_pretrained(
+        model_or_name,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+    ).to(device)
 
 
 def _infer_target_modules(model: PreTrainedModel) -> list[str]:
@@ -133,6 +141,11 @@ def train_micro_lora_adapter(
 ) -> Path:
     set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch_dtype = resolve_torch_dtype(config.torch_dtype, device=device)
+    if config.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+    if config.max_grad_norm <= 0.0:
+        raise ValueError("max_grad_norm must be positive")
 
     if isinstance(prompts, Dataset):
         dataset = prompts
@@ -151,11 +164,12 @@ def train_micro_lora_adapter(
             "Draft and target tokenizers must be tokenization-compatible for full-vocabulary KL distillation",
         )
 
-    teacher_model = _load_model(target_model, device=device).eval()
+    teacher_model = _load_model(target_model, device=device, torch_dtype=torch_dtype).eval()
     if adapter_path is not None:
         teacher_model = PeftModel.from_pretrained(teacher_model, adapter_path).to(device).eval()
+    teacher_model.requires_grad_(False)
 
-    student_base = _load_model(draft_model, device=device)
+    student_base = _load_model(draft_model, device=device, torch_dtype=torch_dtype)
     lora_config = LoraConfig(
         r=config.draft_lora_rank,
         lora_alpha=max(config.draft_lora_rank * 2, 8),
@@ -167,12 +181,14 @@ def train_micro_lora_adapter(
     student_model = get_peft_model(student_base, lora_config).train()
 
     dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
-    optimizer = torch.optim.AdamW(student_model.parameters(), lr=config.learning_rate)
+    trainable_parameters = [parameter for parameter in student_model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=config.learning_rate)
     save_root = Path(output_dir)
     save_root.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(config.epochs):
-        for prompt_batch in dataloader:
+        optimizer.zero_grad(set_to_none=True)
+        for step, prompt_batch in enumerate(dataloader):
             batch = list(prompt_batch) if isinstance(prompt_batch, Iterable) else [prompt_batch]
             encoded_inputs = _collate_prompts(batch, draft_tokenizer, max_length=config.max_length)
             encoded_inputs = {key: tensor.to(device) for key, tensor in encoded_inputs.items()}
@@ -181,10 +197,14 @@ def train_micro_lora_adapter(
                 teacher_logits = teacher_model(**encoded_inputs).logits.float()
             student_logits = student_model(**encoded_inputs).logits.float()
             loss = _full_vocab_kl(student_logits, teacher_logits, encoded_inputs["attention_mask"])
+            scaled_loss = loss / config.gradient_accumulation_steps
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            scaled_loss.backward()
+            should_step = (step + 1) % config.gradient_accumulation_steps == 0 or step + 1 == len(dataloader)
+            if should_step:
+                torch.nn.utils.clip_grad_norm_(trainable_parameters, config.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
         if config.save_every_epoch:
             epoch_dir = save_root / f"epoch_{epoch + 1}"

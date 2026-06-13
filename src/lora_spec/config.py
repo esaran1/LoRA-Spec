@@ -15,8 +15,10 @@ class ModelPairConfig(BaseModel):
 class AdapterConfig(BaseModel):
     rank: int = Field(..., ge=1)
     domain: str
-    epochs: int = Field(..., ge=1)
+    epochs: int | None = Field(default=None, ge=1)
     hf_path: str
+    magnitude_scale: float = Field(1.0, gt=0.0)
+    target_model: str | None = None
 
 
 class ExperimentConfig(BaseModel):
@@ -27,6 +29,8 @@ class ExperimentConfig(BaseModel):
     seed: int = 7
     speculation_length: int = Field(4, ge=1)
     max_tokens: int = Field(128, ge=1)
+    warmup_prompts: int = Field(2, ge=1)
+    warmup_tokens: int = Field(8, ge=1)
     gpu_memory_utilization: float = Field(0.85, gt=0.0, le=1.0)
     trust_remote_code: bool = False
 

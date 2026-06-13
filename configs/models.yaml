@@ -1,7 +1,15 @@
 model_pairs:
   llama3_8b_1b:
     target_model: meta-llama/Meta-Llama-3-8B-Instruct
-    draft_model: meta-llama/Meta-Llama-3-1B-Instruct
+    draft_model: meta-llama/Llama-3.2-1B-Instruct
+    tensor_parallel_degree: 1
+  llama3_8b_base_1b:
+    target_model: meta-llama/Meta-Llama-3-8B
+    draft_model: meta-llama/Llama-3.2-1B-Instruct
+    tensor_parallel_degree: 1
+  llama3_nephilim_8b_1b:
+    target_model: grimjim/llama-3-Nephilim-v3-8B
+    draft_model: meta-llama/Llama-3.2-1B-Instruct
     tensor_parallel_degree: 1
   llama3_70b_8b:
     target_model: meta-llama/Meta-Llama-3-70B-Instruct
@@ -15,3 +23,7 @@ model_pairs:
     target_model: Qwen/Qwen2.5-72B-Instruct
     draft_model: Qwen/Qwen2.5-7B-Instruct
     tensor_parallel_degree: 4
+  gemma2_9b_2b:
+    target_model: google/gemma-2-9b-it
+    draft_model: google/gemma-2-2b-it
+    tensor_parallel_degree: 1

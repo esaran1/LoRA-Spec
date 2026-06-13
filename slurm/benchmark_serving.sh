@@ -30,9 +30,8 @@ PATTERN="${PATTERNS[$SLURM_ARRAY_TASK_ID]}"
 CMD=(
   python scripts/benchmark_serving.py
   --target-model meta-llama/Meta-Llama-3-8B-Instruct
-  --draft-model meta-llama/Meta-Llama-3-1B-Instruct
-  --adapter-path bootscoder/Llama-3-Medical-8B-SFT-LoRA
-  --adapter-path grimjim/Llama-3-Instruct-Nephilim-v3-LoRA-8B
+  --draft-model meta-llama/Llama-3.2-1B-Instruct
+  --adapter-path AdnanRiaz107/CodeLLAMA3-8BI-APPS
   --dataset tatsu-lab/alpaca
   --num-prompts 128
   --traffic-pattern "${PATTERN}"

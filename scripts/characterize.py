@@ -63,8 +63,11 @@ def _matches_filters(
         return False
     if filters.get("selected_domain") and str(adapter_values["domain"]) != str(filters["selected_domain"]):
         return False
-    if filters.get("selected_epochs") is not None and int(adapter_values["epochs"]) != int(filters["selected_epochs"]):
-        return False
+    if filters.get("selected_epochs") is not None:
+        if adapter_values.get("epochs") is None:
+            return False
+        if int(adapter_values["epochs"]) != int(filters["selected_epochs"]):
+            return False
     return True
 
 
@@ -169,6 +172,13 @@ def main() -> None:
         adapter_name = entry["adapter_name"]
         model_values = dict(model_pairs[model_pair_name])
         adapter_values = dict(adapters_payload["adapters"][adapter_name])
+        compatible_target = adapter_values.get("target_model")
+        configured_target = model_values.get("target_model")
+        if compatible_target and compatible_target != configured_target:
+            raise ValueError(
+                f"Adapter {adapter_name} targets {compatible_target}, not {configured_target} "
+                f"from model pair {model_pair_name}"
+            )
         logger.info("Preparing characterization for %s x %s", model_pair_name, adapter_name)
 
         experiment = ExperimentConfig(

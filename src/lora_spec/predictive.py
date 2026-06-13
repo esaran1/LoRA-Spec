@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -30,13 +30,12 @@ def r_squared_score(targets: ArrayLike, predictions: ArrayLike) -> float:
     return 1.0 - (ss_res / ss_tot)
 
 
-class _BaseRegressor:
-    def fit(self, features: ArrayLike, targets: ArrayLike) -> "_BaseRegressor":
-        raise NotImplementedError
+class Regressor(Protocol):
+    fit: Callable[[ArrayLike, ArrayLike], "Regressor"]
+    predict: Callable[[ArrayLike], np.ndarray]
 
-    def predict(self, features: ArrayLike) -> np.ndarray:
-        raise NotImplementedError
 
+class _EvaluationMixin:
     def evaluate(self, features: ArrayLike, targets: ArrayLike) -> RegressionMetrics:
         predictions = self.predict(features)
         y_true = np.asarray(targets, dtype=np.float64).reshape(-1)
@@ -49,7 +48,7 @@ class _BaseRegressor:
         )
 
 
-class LinearRegressionModel(_BaseRegressor):
+class LinearRegressionModel(_EvaluationMixin):
     def __init__(self, feature_index: int = 0) -> None:
         self.feature_index = feature_index
         self.coefficients: np.ndarray | None = None
@@ -75,7 +74,7 @@ class LinearRegressionModel(_BaseRegressor):
         return (design @ self.coefficients).reshape(-1)
 
 
-class MultivariateRegressionModel(_BaseRegressor):
+class MultivariateRegressionModel(_EvaluationMixin):
     def __init__(self, ridge: float = 1e-6) -> None:
         self.ridge = ridge
         self.coefficients: np.ndarray | None = None
@@ -101,7 +100,7 @@ class MultivariateRegressionModel(_BaseRegressor):
         return (design @ self.coefficients).reshape(-1)
 
 
-class MLPRegressionModel(_BaseRegressor):
+class MLPRegressionModel(_EvaluationMixin):
     def __init__(
         self,
         hidden_dim: int = 32,
@@ -165,7 +164,7 @@ class MLPRegressionModel(_BaseRegressor):
 
 
 def leave_one_out_cv(
-    model_factory: Callable[[], _BaseRegressor],
+    model_factory: Callable[[], Regressor],
     features: ArrayLike,
     targets: ArrayLike,
 ) -> RegressionMetrics:

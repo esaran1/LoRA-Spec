@@ -74,9 +74,9 @@ class TrafficBenchmarkResult:
 
 
 def _infer_text_field(sample: dict[str, Any]) -> str:
-    for field in ("text", "prompt", "instruction", "question", "content"):
-        if field in sample and isinstance(sample[field], str) and sample[field].strip():
-            return field
+    for field_name in ("text", "prompt", "instruction", "question", "content"):
+        if field_name in sample and isinstance(sample[field_name], str) and sample[field_name].strip():
+            return field_name
     if {"instruction", "input"} <= set(sample):
         return "instruction"
     raise ValueError("Could not infer a text field from the dataset sample")

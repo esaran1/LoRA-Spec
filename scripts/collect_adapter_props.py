@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapted-model", type=str, default=None)
     parser.add_argument("--adapted-adapter-path", type=str, default=None)
     parser.add_argument("--prompts-file", type=str, default=None)
+    parser.add_argument("--magnitude-scale", type=float, default=1.0)
     parser.add_argument("--output-dir", type=str, default="results/adapter_props")
     return parser.parse_args()
 
@@ -42,10 +43,18 @@ def main() -> None:
     adapted_model = get_config_value(config_data, args, "adapted_model")
     adapted_adapter_path = get_config_value(config_data, args, "adapted_adapter_path") or adapter_path
     prompts_file = get_config_value(config_data, args, "prompts_file")
+    magnitude_scale = float(get_config_value(config_data, args, "magnitude_scale"))
     output_dir = str(get_config_value(config_data, args, "output_dir"))
 
     properties = compute_adapter_properties(adapter_path, base_model=base_model)
-    payload: dict[str, object] = {"properties": properties.__dict__}
+    scaled_properties = {
+        **properties.__dict__,
+        "frobenius_norm_sum": properties.frobenius_norm_sum * magnitude_scale,
+        "spectral_norm_sum": properties.spectral_norm_sum * magnitude_scale,
+        "max_spectral_norm": properties.max_spectral_norm * magnitude_scale,
+        "magnitude_scale": magnitude_scale,
+    }
+    payload: dict[str, object] = {"properties": scaled_properties}
     if base_model and prompts_file:
         prompts = [
             line.strip()
@@ -78,6 +87,7 @@ def main() -> None:
             "adapted_model": adapted_model,
             "adapted_adapter_path": adapted_adapter_path,
             "prompts_file": prompts_file,
+            "magnitude_scale": magnitude_scale,
         },
         cwd=Path.cwd(),
     )

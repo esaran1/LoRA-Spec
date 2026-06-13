@@ -1,0 +1,33 @@
+baselines:
+  autoregressive:
+    enabled: true
+    family: decoding
+    description: Target-only autoregressive decoding without speculative assistance.
+  vanilla_speculative:
+    enabled: true
+    family: decoding
+    description: Standard speculative decoding without adapter-aware correction.
+  analytical_mean_shift:
+    enabled: true
+    family: analytical
+    description: Rank-0 correction using the expected logit shift.
+  analytical_low_rank:
+    enabled: true
+    family: analytical
+    description: Closed-form low-rank correction derived from the calibrated logit-shift matrix.
+  context_dependent:
+    enabled: true
+    family: hybrid
+    description: Lightweight coefficient predictor over the dominant analytical correction subspace.
+  distillspec_static:
+    enabled: true
+    family: training
+    description: Static draft-side adaptation or distillation baseline for the LoRA-shifted target.
+  eagle_family:
+    enabled: true
+    family: training
+    description: Stronger learned draft-model baseline representative of EAGLE-style methods.
+  micro_lora_upper_bound:
+    enabled: true
+    family: training
+    description: Draft-side micro-LoRA distilled from the adapted target, used as the fallback upper bound.

@@ -27,6 +27,7 @@ class AdapterProperties:
     layer_frobenius_norms: dict[str, float]
     layer_spectral_norms: dict[str, float]
     layer_weight_norm_distribution: dict[str, float]
+    layer_scalings: dict[str, float]
 
 
 @dataclass
@@ -95,6 +96,44 @@ def load_lora_matrices(adapter_path: str | Path) -> dict[str, tuple[torch.Tensor
     return {key: (matrices_b[key], matrices_a[key]) for key in common_keys}
 
 
+def _load_adapter_config(adapter_path: str | Path) -> dict[str, Any]:
+    resolved_path = _resolve_adapter_path(adapter_path)
+    config_path = resolved_path / "adapter_config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"LoRA adapter config is required to compute effective BA scaling: {config_path}")
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Adapter config must contain a JSON object: {config_path}")
+    return payload
+
+
+def _pattern_value(pattern: Any, layer_name: str, default: float) -> float:
+    if not isinstance(pattern, dict):
+        return default
+    if layer_name in pattern:
+        return float(pattern[layer_name])
+    matches = [
+        (str(key), value)
+        for key, value in pattern.items()
+        if layer_name.endswith(str(key)) or str(key).endswith(layer_name)
+    ]
+    if not matches:
+        return default
+    key, value = max(matches, key=lambda item: len(item[0]))
+    _ = key
+    return float(value)
+
+
+def _layer_lora_scaling(adapter_config: dict[str, Any], layer_name: str, matrix_a: torch.Tensor) -> float:
+    inferred_rank = int(matrix_a.shape[0])
+    rank = _pattern_value(adapter_config.get("rank_pattern"), layer_name, float(adapter_config.get("r", inferred_rank)))
+    alpha = _pattern_value(adapter_config.get("alpha_pattern"), layer_name, float(adapter_config.get("lora_alpha", rank)))
+    if rank <= 0:
+        raise ValueError(f"Invalid LoRA rank for {layer_name}: {rank}")
+    denominator = rank**0.5 if bool(adapter_config.get("use_rslora", False)) else rank
+    return float(alpha / denominator)
+
+
 def _infer_base_parameter_count(
     base_model: str | torch.nn.Module | None,
 ) -> int:
@@ -111,25 +150,47 @@ def _infer_base_parameter_count(
             torch.cuda.empty_cache()
 
 
+def _low_rank_product_singular_values(
+    matrix_b: torch.Tensor,
+    matrix_a: torch.Tensor,
+    scaling: float,
+) -> torch.Tensor:
+    if matrix_b.ndim != 2 or matrix_a.ndim != 2:
+        raise ValueError("LoRA matrices must be two-dimensional")
+    if matrix_b.shape[1] != matrix_a.shape[0]:
+        raise ValueError(
+            f"Incompatible LoRA shapes: B={tuple(matrix_b.shape)}, A={tuple(matrix_a.shape)}",
+        )
+    _, triangular_b = torch.linalg.qr(matrix_b.float(), mode="reduced")
+    _, triangular_a_transpose = torch.linalg.qr(matrix_a.float().T, mode="reduced")
+    core = (triangular_b @ triangular_a_transpose.T) * scaling
+    return torch.linalg.svdvals(core)
+
+
 def compute_adapter_properties(
     adapter_path: str | Path,
     base_model: str | torch.nn.Module | None = None,
 ) -> AdapterProperties:
     matrices = load_lora_matrices(adapter_path)
+    adapter_config = _load_adapter_config(adapter_path)
     layer_frobenius_norms: dict[str, float] = {}
     layer_spectral_norms: dict[str, float] = {}
     layer_weight_norm_distribution: dict[str, float] = {}
     adapted_parameter_count = 0
+    layer_scalings: dict[str, float] = {}
 
     for layer_name, (matrix_b, matrix_a) in matrices.items():
-        product = matrix_b @ matrix_a
+        scaling = _layer_lora_scaling(adapter_config, layer_name, matrix_a)
+        singular_values = _low_rank_product_singular_values(matrix_b, matrix_a, scaling)
         adapted_parameter_count += matrix_b.numel() + matrix_a.numel()
-        fro_value = float(torch.linalg.matrix_norm(product, ord="fro").item())
-        spectral_value = float(torch.linalg.matrix_norm(product, ord=2).item())
-        weight_norm = float(product.norm().item() / max(product.numel(), 1))
+        fro_value = float(torch.linalg.vector_norm(singular_values).item())
+        spectral_value = float(singular_values.max().item())
+        dense_parameter_count = matrix_b.shape[0] * matrix_a.shape[1]
+        weight_norm = float(fro_value / max(dense_parameter_count**0.5, 1.0))
         layer_frobenius_norms[layer_name] = fro_value
         layer_spectral_norms[layer_name] = spectral_value
         layer_weight_norm_distribution[layer_name] = weight_norm
+        layer_scalings[layer_name] = scaling
 
     base_parameter_count = _infer_base_parameter_count(base_model)
     fraction = (
@@ -146,6 +207,7 @@ def compute_adapter_properties(
         layer_frobenius_norms=layer_frobenius_norms,
         layer_spectral_norms=layer_spectral_norms,
         layer_weight_norm_distribution=layer_weight_norm_distribution,
+        layer_scalings=layer_scalings,
     )
 
 

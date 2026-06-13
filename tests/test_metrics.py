@@ -16,34 +16,50 @@ from lora_spec.metrics import (
 
 def test_acceptance_accumulator_accounts_for_bonus_token() -> None:
     accumulator = AcceptanceAccumulator(speculation_length=3)
-    accumulator.record([True, True, True, True])
+    accumulator.record([True, True, True], bonus_tokens=1)
     summary = accumulator.summarize()
     assert summary.total_drafted_tokens == 3
     assert summary.accepted_drafted_tokens == 3
     assert summary.bonus_tokens == 1
     assert summary.overall_acceptance_rate == 1.0
     assert summary.per_position_acceptance_rate == [1.0, 1.0, 1.0]
+    assert summary.acceptance_by_depth == [1.0, 1.0, 1.0]
+
+
+def test_bonus_token_does_not_inflate_draft_acceptance() -> None:
+    accumulator = AcceptanceAccumulator(speculation_length=3)
+    accumulator.record([True, True, True], bonus_tokens=1)
+    accumulator.record([False, False, False])
+    summary = accumulator.summarize()
+    assert summary.bonus_tokens == 1
+    assert summary.total_drafted_tokens == 6
+    assert summary.accepted_drafted_tokens == 3
+    assert summary.overall_acceptance_rate == pytest.approx(0.5)
 
 
 def test_patch_vllm_rejection_sampler_collects_boolean_masks() -> None:
-    rejection_module = types.ModuleType("vllm.spec_decode.rejection_sampler")
+    rejection_module = types.ModuleType("vllm.model_executor.layers.rejection_sampler")
 
     class RejectionSampler:
-        def forward(self) -> torch.Tensor:
+        def _get_accepted(self) -> torch.Tensor:
             return torch.tensor([[1, 0, 1]], dtype=torch.int64)
 
     rejection_module.RejectionSampler = RejectionSampler
     sys.modules["vllm"] = types.ModuleType("vllm")
-    sys.modules["vllm.spec_decode"] = types.ModuleType("vllm.spec_decode")
-    sys.modules["vllm.spec_decode.rejection_sampler"] = rejection_module
+    sys.modules["vllm.model_executor"] = types.ModuleType("vllm.model_executor")
+    sys.modules["vllm.model_executor.layers"] = types.ModuleType("vllm.model_executor.layers")
+    sys.modules["vllm.model_executor.layers.rejection_sampler"] = rejection_module
 
     sampler = RejectionSampler()
-    with patch_vllm_rejection_sampler(speculation_length=3) as accumulator:
-        sampler.forward()
+    with patch_vllm_rejection_sampler(speculation_length=3) as (accumulator, backend):
+        sampler._get_accepted()
+    assert backend.endswith("RejectionSampler._get_accepted")
     summary = accumulator.summarize()
     assert summary.total_drafted_tokens == 3
-    assert summary.accepted_drafted_tokens == 2
-    assert summary.per_position_acceptance_rate == [1.0, 0.0, 1.0]
+    assert summary.accepted_drafted_tokens == 1
+    assert summary.per_position_acceptance_rate == [1.0, 0.0, 0.0]
+    assert summary.per_position_attempts == [1, 1, 0]
+    assert summary.acceptance_by_depth == [1.0, 0.0, 0.0]
 
 
 def test_collect_speculative_metrics_infers_timing() -> None:
@@ -59,24 +75,27 @@ def test_collect_speculative_metrics_infers_timing() -> None:
         outputs = [DummyOutputItem()]
         metrics = DummyMetrics()
 
-    rejection_module = types.ModuleType("vllm.spec_decode.rejection_sampler")
+    rejection_module = types.ModuleType("vllm.model_executor.layers.rejection_sampler")
 
-    def sample() -> torch.Tensor:
-        return torch.tensor([True, False, True])
+    class RejectionSampler:
+        def _get_accepted(self) -> torch.Tensor:
+            return torch.tensor([True, False, True])
 
-    rejection_module.sample = sample
+    rejection_module.RejectionSampler = RejectionSampler
     sys.modules["vllm"] = types.ModuleType("vllm")
-    sys.modules["vllm.spec_decode"] = types.ModuleType("vllm.spec_decode")
-    sys.modules["vllm.spec_decode.rejection_sampler"] = rejection_module
+    sys.modules["vllm.model_executor"] = types.ModuleType("vllm.model_executor")
+    sys.modules["vllm.model_executor.layers"] = types.ModuleType("vllm.model_executor.layers")
+    sys.modules["vllm.model_executor.layers.rejection_sampler"] = rejection_module
 
     def generate() -> list[DummyOutput]:
-        rejection_module.sample()
+        RejectionSampler()._get_accepted()
         return [DummyOutput()]
 
     _, metrics = collect_speculative_metrics(generate, speculation_length=3)
-    assert metrics.acceptance.accepted_drafted_tokens == 2
+    assert metrics.acceptance.accepted_drafted_tokens == 1
     assert metrics.timing.total_generated_tokens == 3
     assert metrics.timing.ttft_ms == pytest.approx(50.0)
+    assert metrics.instrumentation_backend.endswith("RejectionSampler._get_accepted")
 
 
 def test_simulate_speculative_decoding_tracks_acceptance_and_bonus_tokens() -> None:
@@ -119,6 +138,7 @@ def test_simulate_speculative_decoding_tracks_acceptance_and_bonus_tokens() -> N
     assert metrics.acceptance.accepted_drafted_tokens == 2
     assert metrics.acceptance.bonus_tokens == 1
     assert metrics.acceptance.per_position_acceptance_rate == [0.5, 1.0]
+    assert metrics.acceptance.acceptance_by_depth == [0.5, 1.0]
     assert metrics.emitted_tokens == 4
     assert metrics.target_model_calls == 2
     assert metrics.tokens_per_target_call == pytest.approx(2.0)

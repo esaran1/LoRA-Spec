@@ -6,9 +6,8 @@ import torch
 pytest.importorskip("transformers")
 
 from transformers import PreTrainedModel, PretrainedConfig
-from transformers.modeling_outputs import CausalLMOutput
 
-from lora_spec.correction import DistributionOffsetCorrection, JacobianCorrection, LowRankCorrection
+from lora_spec.correction import ContextDependentCorrection, LowRankCorrection, MeanShiftCorrection
 
 
 class TinyConfig(PretrainedConfig):
@@ -43,15 +42,23 @@ class TinyTokenizer:
         }
 
 
+class TinyOutput:
+    def __init__(self, logits: torch.Tensor, hidden_states: tuple[torch.Tensor, ...] | None = None) -> None:
+        self.logits = logits
+        self.hidden_states = hidden_states
+
+
 class TinyLM(PreTrainedModel):
     config_class = TinyConfig
 
-    def __init__(self, delta: torch.Tensor | None = None) -> None:
+    def __init__(self, shift_matrix: torch.Tensor | None = None) -> None:
         super().__init__(TinyConfig())
         self.embedding = torch.nn.Embedding(self.config.vocab_size, self.config.vocab_size)
         self.lm_head = torch.nn.Linear(self.config.vocab_size, self.config.vocab_size, bias=False)
-        self.lora_delta = torch.nn.Parameter(
-            torch.zeros(self.config.vocab_size) if delta is None else delta.clone().float(),
+        self.shift_matrix = torch.nn.Parameter(
+            torch.zeros(self.config.vocab_size, self.config.vocab_size)
+            if shift_matrix is None
+            else shift_matrix.clone().float(),
         )
         with torch.no_grad():
             self.embedding.weight.copy_(torch.eye(self.config.vocab_size))
@@ -60,44 +67,81 @@ class TinyLM(PreTrainedModel):
     def get_output_embeddings(self):
         return self.lm_head
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, **kwargs):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        output_hidden_states: bool = False,
+        **kwargs,
+    ):
         hidden = self.embedding(input_ids)
-        logits = self.lm_head(hidden) + self.lora_delta.view(1, 1, -1)
-        return CausalLMOutput(logits=logits)
+        logits = self.lm_head(hidden) + hidden @ self.shift_matrix
+        hidden_states = (hidden,) if output_hidden_states else None
+        return TinyOutput(logits=logits, hidden_states=hidden_states)
 
 
-def test_distribution_offset_correction_recovers_constant_shift() -> None:
+def test_mean_shift_correction_recovers_constant_shift() -> None:
     tokenizer = TinyTokenizer()
+    delta = torch.tensor(
+        [
+            [0.4, -0.2, 0.1, -0.3],
+            [0.4, -0.2, 0.1, -0.3],
+            [0.4, -0.2, 0.1, -0.3],
+            [0.4, -0.2, 0.1, -0.3],
+        ],
+    )
     base = TinyLM()
-    delta = torch.tensor([0.4, -0.2, 0.1, -0.3])
-    adapted = TinyLM(delta=delta)
-    correction = DistributionOffsetCorrection().calibrate(base, adapted, ["0 1 2", "1 2 3"], tokenizer=tokenizer)
+    adapted = TinyLM(shift_matrix=delta)
+    correction = MeanShiftCorrection().calibrate(base, adapted, ["0 1 2", "1 2 3"], tokenizer=tokenizer)
     adjusted = correction.apply(torch.zeros(1, tokenizer.vocab_size)).squeeze(0)
     assert adjusted.shape[0] == tokenizer.vocab_size
-    assert adjusted.mean().item() == adjusted.mean().item()
+    assert torch.allclose(adjusted, delta.mean(dim=0), atol=1e-5)
 
 
-def test_low_rank_correction_returns_vocab_sized_adjustment() -> None:
+def test_low_rank_correction_recovers_structured_shift() -> None:
     tokenizer = TinyTokenizer()
+    left = torch.tensor([[1.0], [0.0], [1.0], [0.0]])
+    right = torch.tensor([[0.5, -0.25, 0.125, -0.125]])
+    shift_matrix = left @ right
     base = TinyLM()
-    adapted = TinyLM(delta=torch.tensor([0.2, 0.1, -0.3, 0.0]))
-    correction = LowRankCorrection(rank=2).calibrate(base, adapted, ["0 1 2", "1 2 3"], tokenizer=tokenizer)
-    adjusted = correction.apply(torch.zeros(1, tokenizer.vocab_size))
-    assert adjusted.shape == (1, tokenizer.vocab_size)
-    assert torch.isfinite(adjusted).all()
+    adapted = TinyLM(shift_matrix=shift_matrix)
+    correction = LowRankCorrection(rank=1).calibrate(base, adapted, ["0 1 2 3", "1 2 3 0"], tokenizer=tokenizer)
+    logits = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    adjusted = correction.apply(logits)
+    expected = logits + shift_matrix[0].view(1, -1)
+    assert adjusted.shape == expected.shape
+    assert torch.linalg.norm(adjusted - expected) < 0.2
+    report = correction.approximation_error()
+    assert report.selected_rank == 1
+    assert report.spectral_tail_relative_frobenius <= 1.0
+    assert report.centered_shift_reconstruction_relative_frobenius < 1e-4
+    assert report.coefficient_regression_relative_frobenius < 0.2
+    assert report.centered_operator_relative_frobenius == pytest.approx(
+        report.predicted_centered_operator_relative_frobenius,
+        abs=1e-5,
+    )
+    assert report.operator_calibration_relative_frobenius < 0.2
 
 
-def test_jacobian_correction_estimates_shift_for_linear_tiny_model() -> None:
+def test_context_dependent_correction_uses_hidden_state() -> None:
     tokenizer = TinyTokenizer()
+    shift_matrix = torch.tensor(
+        [
+            [0.4, -0.4, 0.0, 0.0],
+            [0.0, 0.0, 0.3, -0.3],
+            [0.4, -0.4, 0.0, 0.0],
+            [0.0, 0.0, 0.3, -0.3],
+        ],
+    )
     base = TinyLM()
-    delta = torch.tensor([0.5, -0.25, 0.0, 0.25])
-    adapted = TinyLM(delta=delta)
-    correction = JacobianCorrection(probe_count=4, max_params=2, seed=0).calibrate(
+    adapted = TinyLM(shift_matrix=shift_matrix)
+    correction = ContextDependentCorrection(rank=2, hidden_dim=8, epochs=100, lr=1e-2, seed=0).calibrate(
         base,
         adapted,
-        ["0 1 2 3"],
+        ["0 1 2 3", "2 3 0 1"],
         tokenizer=tokenizer,
     )
-    adjusted = correction.apply(torch.zeros(1, tokenizer.vocab_size)).squeeze(0)
-    assert adjusted.shape == delta.shape
-    assert torch.linalg.norm(adjusted) > 0
+    hidden_state = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    adjusted = correction.apply(torch.zeros(1, tokenizer.vocab_size), hidden_state=hidden_state)
+    expected = shift_matrix[0].view(1, -1)
+    assert torch.linalg.norm(adjusted - expected) < 0.25

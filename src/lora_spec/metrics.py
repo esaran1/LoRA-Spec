@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from types import ModuleType
 from typing import Any, Callable
 
 import torch
@@ -13,6 +14,9 @@ import torch
 class AcceptanceMetrics:
     overall_acceptance_rate: float
     per_position_acceptance_rate: list[float]
+    per_position_attempts: list[int]
+    per_position_accepted: list[int]
+    acceptance_by_depth: list[float]
     accepted_drafted_tokens: int
     total_drafted_tokens: int
     bonus_tokens: int
@@ -31,6 +35,7 @@ class TimingMetrics:
 class SpeculativeDecodingMetrics:
     acceptance: AcceptanceMetrics
     timing: TimingMetrics
+    instrumentation_backend: str
     raw_decisions: list[list[bool]] = field(default_factory=list)
 
 
@@ -50,54 +55,65 @@ class AcceptanceAccumulator:
         self.speculation_length = speculation_length
         self.accepted_per_position: list[int] = []
         self.attempted_per_position: list[int] = []
+        self.accepted_prefix_per_depth: list[int] = []
+        self.attempted_prefix_per_depth: list[int] = []
         self.accepted_drafted_tokens = 0
         self.total_drafted_tokens = 0
         self.bonus_tokens = 0
         self.speculative_steps = 0
         self.raw_decisions: list[list[bool]] = []
 
-    def record(self, decisions: list[bool]) -> None:
+    def record(self, decisions: list[bool], bonus_tokens: int = 0) -> None:
         if not decisions:
             return
-        drafted_length = len(decisions)
-        has_bonus = False
-        if self.speculation_length is not None and drafted_length == self.speculation_length + 1:
-            has_bonus = True
-            drafted_length -= 1
-        elif self.speculation_length is not None and drafted_length > self.speculation_length:
-            has_bonus = True
-            drafted_length = self.speculation_length
-        elif drafted_length > 1 and all(decisions[:-1]) and decisions[-1]:
-            has_bonus = True
-            drafted_length -= 1
-
-        drafted_decisions = decisions[:drafted_length]
-        bonus_decision = decisions[drafted_length] if has_bonus and drafted_length < len(decisions) else False
-        self.raw_decisions.append(list(decisions))
+        if bonus_tokens < 0:
+            raise ValueError("bonus_tokens must be non-negative")
+        drafted_decisions = [bool(value) for value in decisions]
+        drafted_length = len(drafted_decisions)
         self.speculative_steps += 1
         self.total_drafted_tokens += drafted_length
-        self.accepted_drafted_tokens += sum(bool(value) for value in drafted_decisions)
 
         while len(self.accepted_per_position) < drafted_length:
             self.accepted_per_position.append(0)
             self.attempted_per_position.append(0)
+            self.accepted_prefix_per_depth.append(0)
+            self.attempted_prefix_per_depth.append(0)
+        prefix_survives = True
+        effective_decisions: list[bool] = []
         for index, accepted in enumerate(drafted_decisions):
-            self.attempted_per_position[index] += 1
-            self.accepted_per_position[index] += int(accepted)
-        if bonus_decision:
-            self.bonus_tokens += 1
+            reached_position = prefix_survives
+            if reached_position:
+                self.attempted_per_position[index] += 1
+                self.accepted_per_position[index] += int(accepted)
+            prefix_survives = reached_position and accepted
+            effective_decisions.append(prefix_survives)
+            self.attempted_prefix_per_depth[index] += 1
+            self.accepted_prefix_per_depth[index] += int(prefix_survives)
+        self.accepted_drafted_tokens += sum(effective_decisions)
+        self.raw_decisions.append(drafted_decisions)
+        self.bonus_tokens += bonus_tokens
 
     def summarize(self) -> AcceptanceMetrics:
-        denominator = self.total_drafted_tokens + self.bonus_tokens
-        numerator = self.accepted_drafted_tokens + self.bonus_tokens
+        denominator = self.total_drafted_tokens
+        numerator = self.accepted_drafted_tokens
         overall = float(numerator / denominator) if denominator > 0 else 0.0
         per_position = [
             float(accepted / attempted) if attempted > 0 else 0.0
             for accepted, attempted in zip(self.accepted_per_position, self.attempted_per_position)
         ]
+        acceptance_by_depth = [
+            float(accepted / attempted) if attempted > 0 else 0.0
+            for accepted, attempted in zip(
+                self.accepted_prefix_per_depth,
+                self.attempted_prefix_per_depth,
+            )
+        ]
         return AcceptanceMetrics(
             overall_acceptance_rate=overall,
             per_position_acceptance_rate=per_position,
+            per_position_attempts=list(self.attempted_per_position),
+            per_position_accepted=list(self.accepted_per_position),
+            acceptance_by_depth=acceptance_by_depth,
             accepted_drafted_tokens=self.accepted_drafted_tokens,
             total_drafted_tokens=self.total_drafted_tokens,
             bonus_tokens=self.bonus_tokens,
@@ -133,78 +149,82 @@ def _extract_boolean_tensor(payload: Any) -> torch.Tensor | None:
     return None
 
 
-def _record_tensor(accumulator: AcceptanceAccumulator, tensor: torch.Tensor) -> None:
+def _record_tensor(
+    accumulator: AcceptanceAccumulator,
+    tensor: torch.Tensor,
+    bonus_enabled: bool = False,
+) -> None:
     data = tensor.detach().cpu()
     if data.ndim == 0:
-        accumulator.record([bool(data.item())])
+        decision = bool(data.item())
+        accumulator.record([decision], bonus_tokens=int(bonus_enabled and decision))
         return
     if data.ndim == 1:
-        accumulator.record([bool(value) for value in data.tolist()])
+        decisions = [bool(value) for value in data.tolist()]
+        accumulator.record(decisions, bonus_tokens=int(bonus_enabled and all(decisions)))
         return
     flattened = data.reshape(-1, data.shape[-1])
     for row in flattened:
-        accumulator.record([bool(value) for value in row.tolist()])
+        decisions = [bool(value) for value in row.tolist()]
+        accumulator.record(decisions, bonus_tokens=int(bonus_enabled and all(decisions)))
 
 
-def _wrap_callable(
-    owner: Any,
-    attribute_name: str,
+def _wrap_acceptance_method(
+    rejection_sampler_class: type[Any],
     accumulator: AcceptanceAccumulator,
     restored: list[tuple[Any, str, Any]],
 ) -> None:
-    original = getattr(owner, attribute_name, None)
+    attribute_name = "_get_accepted"
+    original = getattr(rejection_sampler_class, attribute_name, None)
     if original is None or not callable(original):
-        return
+        raise RuntimeError("Installed vLLM RejectionSampler does not expose _get_accepted")
 
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         result = original(*args, **kwargs)
         decisions = _extract_boolean_tensor(result)
-        if decisions is not None:
-            _record_tensor(accumulator, decisions)
+        if decisions is None:
+            raise RuntimeError("vLLM RejectionSampler._get_accepted did not return a boolean mask")
+        sampler = args[0] if args else None
+        bonus_enabled = not bool(getattr(sampler, "_disable_bonus_tokens", True))
+        _record_tensor(accumulator, decisions, bonus_enabled=bonus_enabled)
         return result
 
-    setattr(owner, attribute_name, wrapped)
-    restored.append((owner, attribute_name, original))
+    setattr(rejection_sampler_class, attribute_name, wrapped)
+    restored.append((rejection_sampler_class, attribute_name, original))
+
+
+def _resolve_vllm_rejection_sampler() -> tuple[type[Any], str]:
+    candidates = (
+        "vllm.model_executor.layers.rejection_sampler",
+        "vllm.spec_decode.rejection_sampler",
+    )
+    errors: list[str] = []
+    for module_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            errors.append(f"{module_name}: {exc}")
+            continue
+        rejection_sampler_class = getattr(module, "RejectionSampler", None)
+        if isinstance(rejection_sampler_class, type):
+            return rejection_sampler_class, f"{module_name}.RejectionSampler._get_accepted"
+        errors.append(f"{module_name}: RejectionSampler class not found")
+    raise ImportError("No supported vLLM rejection sampler was found: " + "; ".join(errors))
 
 
 @contextlib.contextmanager
 def patch_vllm_rejection_sampler(
     speculation_length: int | None = None,
-) -> AcceptanceAccumulator:
-    try:
-        import vllm.spec_decode.rejection_sampler as rejection_sampler
-    except ImportError as exc:  # pragma: no cover - requires vLLM runtime
-        raise ImportError("vLLM must be installed to patch speculative decoding internals") from exc
-
+) -> Iterator[tuple[AcceptanceAccumulator, str]]:
+    rejection_sampler_class, backend = _resolve_vllm_rejection_sampler()
     accumulator = AcceptanceAccumulator(speculation_length=speculation_length)
     restored: list[tuple[Any, str, Any]] = []
-    candidate_names = [
-        "forward",
-        "__call__",
-        "sample",
-        "modified_rejection_sampling",
-        "_batch_modified_rejection_sampling",
-        "batch_modified_rejection_sampling",
-    ]
-
-    for owner in _candidate_owners(rejection_sampler):
-        for candidate_name in candidate_names:
-            _wrap_callable(owner, candidate_name, accumulator, restored)
+    _wrap_acceptance_method(rejection_sampler_class, accumulator, restored)
     try:
-        yield accumulator
+        yield accumulator, backend
     finally:
         for owner, attribute_name, original in reversed(restored):
             setattr(owner, attribute_name, original)
-
-
-def _candidate_owners(module: ModuleType) -> list[Any]:
-    owners: list[Any] = [module]
-    for attribute_name in dir(module):
-        value = getattr(module, attribute_name)
-        if isinstance(value, type):
-            owners.append(value)
-    return owners
-
 
 def infer_timing_metrics(
     outputs: list[Any],
@@ -238,25 +258,45 @@ def collect_speculative_metrics(
     generate_fn: Callable[[], list[Any]],
     speculation_length: int | None = None,
 ) -> tuple[list[Any], SpeculativeDecodingMetrics]:
-    with patch_vllm_rejection_sampler(speculation_length=speculation_length) as accumulator:
+    with patch_vllm_rejection_sampler(speculation_length=speculation_length) as (accumulator, backend):
         start_time = time.perf_counter()
         outputs = generate_fn()
         wall_time_s = time.perf_counter() - start_time
     acceptance = accumulator.summarize()
+    if acceptance.total_drafted_tokens == 0:
+        raise RuntimeError(
+            "No vLLM rejection decisions were captured. The sampler likely ran in a separate worker process; "
+            "this instrumentation backend is unsupported for that executor and will not emit false metrics."
+        )
     timing = infer_timing_metrics(outputs, wall_time_s)
     return outputs, SpeculativeDecodingMetrics(
         acceptance=acceptance,
         timing=timing,
+        instrumentation_backend=backend,
         raw_decisions=accumulator.raw_decisions,
     )
 
 
-def _next_token_logits(model: Any, input_ids: torch.Tensor) -> torch.Tensor:
-    outputs = model(input_ids=input_ids)
+def _next_token_output(
+    model: Any,
+    input_ids: torch.Tensor,
+    output_hidden_states: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    try:
+        outputs = model(input_ids=input_ids, output_hidden_states=output_hidden_states)
+    except TypeError:
+        if output_hidden_states:
+            raise
+        outputs = model(input_ids=input_ids)
     logits = getattr(outputs, "logits", None)
     if logits is None:
         raise ValueError("Model outputs must expose a logits tensor")
-    return logits[:, -1, :].float()
+    hidden_state = None
+    if output_hidden_states:
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states:
+            hidden_state = hidden_states[-1][:, -1, :].float()
+    return logits[:, -1, :].float(), hidden_state
 
 
 def _greedy_token(logits: torch.Tensor) -> torch.Tensor:
@@ -287,10 +327,15 @@ def simulate_speculative_decoding(
             draft_context = context
             proposed_tokens: list[int] = []
             for _ in range(current_spec_length):
-                draft_logits = _next_token_logits(draft_model, draft_context)
+                requires_hidden = bool(getattr(correction, "requires_hidden_state", False)) if correction is not None else False
+                draft_logits, hidden_state = _next_token_output(
+                    draft_model,
+                    draft_context,
+                    output_hidden_states=requires_hidden,
+                )
                 draft_model_calls += 1
                 if correction is not None:
-                    draft_logits = correction.apply(draft_logits)
+                    draft_logits = correction.apply(draft_logits, hidden_state=hidden_state)
                 next_token = int(_greedy_token(draft_logits)[0].item())
                 proposed_tokens.append(next_token)
                 next_token_tensor = torch.tensor([[next_token]], device=draft_context.device, dtype=draft_context.dtype)
@@ -324,13 +369,14 @@ def simulate_speculative_decoding(
                     mismatch = True
                     break
 
+            decisions.extend([False] * (len(proposed_tokens) - len(decisions)))
+
             bonus_allowed = (not mismatch) and (generated_for_prompt + len(accepted_tokens) < max_new_tokens)
             if bonus_allowed:
                 bonus_token = int(torch.argmax(target_logits[prefix_length - 1 + len(proposed_tokens)]).item())
-                decisions.append(True)
                 accepted_tokens.append(bonus_token)
 
-            accumulator.record(decisions)
+            accumulator.record(decisions, bonus_tokens=int(bonus_allowed))
             if not accepted_tokens:
                 break
 

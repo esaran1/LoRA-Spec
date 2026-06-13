@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import logging
+import math
 import os
+import platform
 import random
 import subprocess
 from datetime import datetime, timezone
@@ -35,6 +38,8 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, "use_deterministic_algorithms"):
+        torch.use_deterministic_algorithms(True, warn_only=True)
     if torch.backends.cudnn.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -63,9 +68,13 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc).isoformat()
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return _to_jsonable(value.tolist())
+    if isinstance(value, np.generic):
+        return _to_jsonable(value.item())
     if isinstance(value, torch.Tensor):
-        return value.detach().cpu().tolist()
+        return _to_jsonable(value.detach().cpu().tolist())
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     return value
 
 
@@ -91,6 +100,74 @@ def get_git_hash(cwd: str | Path | None = None) -> str:
     return output.strip()
 
 
+def get_git_dirty(cwd: str | Path | None = None) -> bool | None:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
+def get_runtime_metadata() -> dict[str, Any]:
+    package_versions: dict[str, str] = {}
+    for package_name in ("transformers", "peft", "vllm", "datasets", "safetensors"):
+        try:
+            package_versions[package_name] = importlib.metadata.version(package_name)
+        except importlib.metadata.PackageNotFoundError:
+            package_versions[package_name] = "not-installed"
+    metadata: dict[str, Any] = {
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "package_versions": package_versions,
+    }
+    if torch.cuda.is_available():
+        device_count = torch.cuda.device_count()
+        metadata["gpu_count"] = device_count
+        metadata["gpu_names"] = [torch.cuda.get_device_name(index) for index in range(device_count)]
+        metadata["cuda_version"] = torch.version.cuda
+    else:
+        metadata["gpu_count"] = 0
+        metadata["gpu_names"] = []
+        metadata["cuda_version"] = None
+    return metadata
+
+
+def resolve_torch_dtype(
+    value: str | None = "auto",
+    device: str | torch.device | None = None,
+) -> torch.dtype:
+    normalized = (value or "auto").lower()
+    if normalized == "auto":
+        target_device = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if target_device.type == "cuda":
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            return torch.float16
+        return torch.float32
+    mapping = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    if normalized not in mapping:
+        raise ValueError(f"Unsupported torch dtype: {value}")
+    return mapping[normalized]
+
+
 def write_json_result(
     payload: Mapping[str, Any] | BaseModel | Any,
     output_dir: str | Path,
@@ -108,7 +185,9 @@ def write_json_result(
     metadata = dict(data.get("metadata", {}))
     metadata.update(extra_metadata or {})
     metadata.setdefault("git_hash", get_git_hash(cwd=cwd))
+    metadata.setdefault("git_dirty", get_git_dirty(cwd=cwd))
     metadata.setdefault("timestamp", timestamp)
+    metadata.setdefault("runtime", get_runtime_metadata())
     if config is not None:
         data["full_config"] = _to_jsonable(config)
     data["config_hash"] = config_hash
@@ -132,14 +211,11 @@ def _coerce_override(value: str) -> Any:
         return lowered == "true"
     if lowered == "null":
         return None
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    try:
-        return float(value)
-    except ValueError:
-        pass
+    for converter in (int, float):
+        try:
+            return converter(value)
+        except ValueError:
+            continue
     if value.startswith("[") or value.startswith("{"):
         try:
             return json.loads(value)
