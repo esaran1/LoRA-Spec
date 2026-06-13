@@ -11,6 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, P
 
 from lora_spec.correction import ContextDependentCorrection, LowRankCorrection, MeanShiftCorrection
 from lora_spec.metrics import simulate_speculative_decoding
+from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
 from lora_spec.theory import (
     center_logit_shift_rows,
     first_order_logit_shift,
@@ -35,8 +36,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapted-model", type=str, default=None)
     parser.add_argument("--adapted-adapter-path", type=str, default=None)
     parser.add_argument("--draft-model", type=str, default=None)
-    parser.add_argument("--prompts-file", type=str, default=None)
-    parser.add_argument("--eval-prompts-file", type=str, default=None)
+    parser.add_argument(
+        "--prompts-file",
+        type=str,
+        default="data/prompts/pilot_v1/calibration.jsonl",
+    )
+    parser.add_argument(
+        "--eval-prompts-file",
+        type=str,
+        default="data/prompts/pilot_v1/evaluation.jsonl",
+    )
     parser.add_argument("--low-rank-k", type=int, default=8)
     parser.add_argument("--context-rank", type=int, default=8)
     parser.add_argument("--context-hidden-dim", type=int, default=64)
@@ -49,13 +58,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-speculative-proxy", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results/correction")
     return parser.parse_args()
-
-
-def _load_prompts(path: str) -> list[str]:
-    prompts = [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
-    if not prompts:
-        raise ValueError(f"No prompts found in {path}")
-    return prompts
 
 
 def _load_tokenizer(model_name: str) -> PreTrainedTokenizerBase:
@@ -293,7 +295,9 @@ def main() -> None:
     draft_model_value = get_config_value(config_data, args, "draft_model")
     prompts_file = str(prompts_file_value)
     eval_prompts_file_value = get_config_value(config_data, args, "eval_prompts_file")
-    eval_prompts_file = str(eval_prompts_file_value) if eval_prompts_file_value else prompts_file
+    if not eval_prompts_file_value:
+        raise ValueError("eval_prompts_file must be provided separately from prompts_file")
+    eval_prompts_file = str(eval_prompts_file_value)
     low_rank_k = int(get_config_value(config_data, args, "low_rank_k"))
     context_rank = int(get_config_value(config_data, args, "context_rank"))
     context_hidden_dim = int(get_config_value(config_data, args, "context_hidden_dim"))
@@ -306,8 +310,13 @@ def main() -> None:
     skip_speculative_proxy = bool(get_config_value(config_data, args, "skip_speculative_proxy", args.skip_speculative_proxy))
     output_dir = str(get_config_value(config_data, args, "output_dir"))
 
-    calibration_prompts = _load_prompts(prompts_file)
-    eval_prompts = _load_prompts(eval_prompts_file)
+    calibration_prompts = load_frozen_prompt_texts(prompts_file, expected_split="calibration")
+    eval_prompts = load_frozen_prompt_texts(eval_prompts_file, expected_split="evaluation")
+    prompts_provenance = prompt_file_provenance(prompts_file, expected_split="calibration")
+    eval_prompts_provenance = prompt_file_provenance(
+        eval_prompts_file,
+        expected_split="evaluation",
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch_dtype = resolve_torch_dtype(torch_dtype_name, device=device)
 
@@ -468,6 +477,8 @@ def main() -> None:
             "draft_model": str(draft_model_value) if draft_model_value else None,
             "prompts_file": prompts_file,
             "eval_prompts_file": eval_prompts_file,
+            "prompts_provenance": prompts_provenance,
+            "eval_prompts_provenance": eval_prompts_provenance,
             "low_rank_k": low_rank_k,
             "context_rank": context_rank,
             "context_hidden_dim": context_hidden_dim,

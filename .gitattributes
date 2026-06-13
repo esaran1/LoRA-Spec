@@ -1,0 +1,3 @@
+data/prompts/**/*.jsonl text eol=lf
+data/prompts/**/manifest.json text eol=lf
+data/prompts/**/release.lock.json text eol=lf

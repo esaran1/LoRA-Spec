@@ -35,6 +35,14 @@ pip install -e .[analysis,colab]
 
 ## Main Theory Experiments
 
+Verify the frozen pilot prompt splits before running experiments:
+
+```bash
+python scripts/verify_prompt_splits.py --verbose
+```
+
+The default `pilot_v1` split contains 16 calibration and 32 held-out evaluation prompts, balanced across code, medical, chat, and math. Its byte-level SHA-256 hashes are pinned in `data/prompts/pilot_v1/manifest.json` and independently locked by `release.lock.json`. Scripts enforce calibration/evaluation roles and reject unregistered files. This pilot is intended to validate the research direction before constructing the final benchmark suite.
+
 Measure effective rank of the logit-shift matrix:
 
 ```bash
@@ -42,7 +50,7 @@ python scripts/measure_logit_shift_rank.py \
   --models-config configs/models.yaml \
   --adapters-config configs/adapters.yaml \
   --model-pair llama3_8b_1b \
-  --prompts-file data/calibration_prompts.txt \
+  --prompts-file data/prompts/pilot_v1/calibration.jsonl \
   --verbose
 ```
 
@@ -53,8 +61,8 @@ python scripts/validate_correction_theory.py \
   --base-model meta-llama/Meta-Llama-3-8B-Instruct \
   --draft-model meta-llama/Llama-3.2-1B-Instruct \
   --adapted-adapter-path AdnanRiaz107/CodeLLAMA3-8BI-APPS \
-  --prompts-file data/calibration_prompts.txt \
-  --eval-prompts-file data/eval_prompts.txt \
+  --prompts-file data/prompts/pilot_v1/calibration.jsonl \
+  --eval-prompts-file data/prompts/pilot_v1/evaluation.jsonl \
   --rank-values 0,1,2,4,8,16 \
   --verbose
 ```
@@ -66,8 +74,8 @@ python scripts/phase_transition_sweep.py \
   --base-model meta-llama/Meta-Llama-3-8B-Instruct \
   --draft-model meta-llama/Llama-3.2-1B-Instruct \
   --adapter-path AdnanRiaz107/CodeLLAMA3-8BI-APPS \
-  --prompts-file data/calibration_prompts.txt \
-  --eval-prompts-file data/eval_prompts.txt \
+  --prompts-file data/prompts/pilot_v1/calibration.jsonl \
+  --eval-prompts-file data/prompts/pilot_v1/evaluation.jsonl \
   --verbose
 ```
 
@@ -78,7 +86,7 @@ python scripts/subspace_sharing.py \
   --models-config configs/models.yaml \
   --adapters-config configs/adapters.yaml \
   --model-pair llama3_8b_1b \
-  --prompts-file data/calibration_prompts.txt \
+  --prompts-file data/prompts/pilot_v1/calibration.jsonl \
   --verbose
 ```
 

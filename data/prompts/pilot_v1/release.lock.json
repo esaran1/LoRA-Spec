@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "manifest_name": "lora-spec-pilot-v1",
+  "manifest_sha256": "22d6c1a462f56a48dbf9ba20195bb6c89b4b59d33375aef3594986d776908abe",
+  "split_sha256": {
+    "calibration": "f1d16e63fe92d4339e99c25d9492c21c64a4c02546da3d8c252a00b4ed8e5ee7",
+    "evaluation": "19153e4c087cdd635cf46805924c4e2f7c8fe1bd0aa05d223d30185b40670419"
+  }
+}

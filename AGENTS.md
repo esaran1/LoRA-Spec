@@ -48,6 +48,7 @@ Research-grade implementation requirements:
 - Pydantic for configs and dataclasses for runtime results.
 - Every script accepts `--config` YAML plus CLI overrides.
 - Every experiment writes deterministic JSON artifacts with timestamp, config hash, git hash, seed, GPU/runtime metadata, and full config.
+- Calibration and evaluation prompts must come from a versioned frozen split with byte-level SHA-256 hashes. Result configs must include prompt and manifest provenance, and evaluation prompts must never be used to fit a correction.
 - Logging uses the Python `logging` module only, never `print()`.
 - No TODOs, placeholders, or skeleton functions.
 - Prefer simple, explicit code over framework-heavy abstraction, but keep the measurement path rigorous and reproducible.

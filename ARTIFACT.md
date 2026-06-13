@@ -28,6 +28,14 @@ Every script accepts `--seed`, writes a JSON artifact with:
 
 Use a fixed prompt file for exact reruns of the theory experiments.
 
+Verify the checked-in frozen pilot split and its hashes before running:
+
+```bash
+python scripts/verify_prompt_splits.py --verbose
+```
+
+The authoritative manifest is `data/prompts/pilot_v1/manifest.json`, independently pinned by `data/prompts/pilot_v1/release.lock.json`. Every theory result config records the split role, split SHA-256, manifest SHA-256, release-lock SHA-256, record count, and domain counts. Calibration and evaluation roles are enforced at load time. The split is project-authored and suitable for pilot hypothesis validation; final paper claims require a larger benchmark-derived frozen suite.
+
 ## Interpretation Rules
 
 - `expected_rejection_sampling_acceptance` is the full-vocabulary overlap `sum_v min(p_v, q_v) = 1 - TV(p, q)` on held-out contexts.
@@ -53,7 +61,7 @@ The pinned `vllm==0.5.3.post1` environment is retained to make the sampler instr
 python scripts/measure_logit_shift_rank.py \
   --models-config configs/models.yaml \
   --adapters-config configs/adapters.yaml \
-  --prompts-file data/calibration_prompts.txt \
+  --prompts-file data/prompts/pilot_v1/calibration.jsonl \
   --verbose
 ```
 
@@ -72,8 +80,8 @@ python scripts/validate_correction_theory.py \
   --base-model meta-llama/Meta-Llama-3-8B-Instruct \
   --draft-model meta-llama/Llama-3.2-1B-Instruct \
   --adapted-adapter-path AdnanRiaz107/CodeLLAMA3-8BI-APPS \
-  --prompts-file data/calibration_prompts.txt \
-  --eval-prompts-file data/eval_prompts.txt \
+  --prompts-file data/prompts/pilot_v1/calibration.jsonl \
+  --eval-prompts-file data/prompts/pilot_v1/evaluation.jsonl \
   --rank-values 0,1,2,4,8,16 \
   --verbose
 ```
@@ -87,8 +95,8 @@ python scripts/phase_transition_sweep.py \
   --base-model meta-llama/Meta-Llama-3-8B-Instruct \
   --draft-model meta-llama/Llama-3.2-1B-Instruct \
   --adapter-path AdnanRiaz107/CodeLLAMA3-8BI-APPS \
-  --prompts-file data/calibration_prompts.txt \
-  --eval-prompts-file data/eval_prompts.txt \
+  --prompts-file data/prompts/pilot_v1/calibration.jsonl \
+  --eval-prompts-file data/prompts/pilot_v1/evaluation.jsonl \
   --magnitude-values 0.1,0.25,0.5,0.75,1.0,1.25,1.5,2.0 \
   --verbose
 ```
@@ -102,7 +110,7 @@ python scripts/subspace_sharing.py \
   --models-config configs/models.yaml \
   --adapters-config configs/adapters.yaml \
   --model-pair llama3_8b_1b \
-  --prompts-file data/calibration_prompts.txt \
+  --prompts-file data/prompts/pilot_v1/calibration.jsonl \
   --verbose
 ```
 

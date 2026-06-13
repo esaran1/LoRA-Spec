@@ -10,6 +10,7 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 from lora_spec.adapter_props import compute_adapter_properties, read_adapter_metadata
+from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
 from lora_spec.theory import effective_rank, spectral_analysis
 from lora_spec.utils import (
     add_common_args,
@@ -31,7 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapters-config", type=str, default="configs/adapters.yaml")
     parser.add_argument("--model-pair", type=str, default=None)
     parser.add_argument("--adapter-name", action="append", default=[])
-    parser.add_argument("--prompts-file", type=str, default=None)
+    parser.add_argument(
+        "--prompts-file",
+        type=str,
+        default="data/prompts/pilot_v1/calibration.jsonl",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--energy-threshold", type=float, default=0.99)
     parser.add_argument("--torch-dtype", type=str, default="auto")
@@ -41,13 +46,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default="results/theory")
     parser.add_argument("--plots-dir", type=str, default="results/theory/plots")
     return parser.parse_args()
-
-
-def _load_prompts(path: str) -> list[str]:
-    prompts = [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
-    if not prompts:
-        raise ValueError(f"No prompts found in {path}")
-    return prompts
 
 
 def _load_base_model_and_tokenizer(
@@ -223,9 +221,10 @@ def main() -> None:
 
     models_config = str(get_config_value(config_data, args, "models_config"))
     adapters_config = str(get_config_value(config_data, args, "adapters_config"))
-    prompts_file = str(get_config_value(config_data, args, "prompts_file"))
-    if not prompts_file:
+    prompts_file_value = get_config_value(config_data, args, "prompts_file")
+    if not prompts_file_value:
         raise ValueError("prompts_file must be provided")
+    prompts_file = str(prompts_file_value)
     model_pair = get_config_value(config_data, args, "model_pair")
     adapter_names = get_config_value(config_data, args, "adapter_name", args.adapter_name)
     if isinstance(adapter_names, str):
@@ -239,7 +238,8 @@ def main() -> None:
     output_dir = str(get_config_value(config_data, args, "output_dir"))
     plots_dir = ensure_dir(str(get_config_value(config_data, args, "plots_dir")))
 
-    prompts = _load_prompts(prompts_file)
+    prompts = load_frozen_prompt_texts(prompts_file, expected_split="calibration")
+    prompts_provenance = prompt_file_provenance(prompts_file, expected_split="calibration")
     experiments = _select_experiments(
         models_config=models_config,
         adapters_config=adapters_config,
@@ -396,6 +396,7 @@ def main() -> None:
             "num_experiments": len(rows),
             "energy_threshold": energy_threshold,
             "prompts_file": prompts_file,
+            "prompts_provenance": prompts_provenance,
             "batch_size": batch_size,
             "logit_gauge": "row_mean_centered_before_projection",
         },
@@ -410,6 +411,7 @@ def main() -> None:
             "model_pair": model_pair,
             "adapter_names": list(adapter_names or []),
             "prompts_file": prompts_file,
+            "prompts_provenance": prompts_provenance,
             "batch_size": batch_size,
             "energy_threshold": energy_threshold,
             "torch_dtype": torch_dtype_name,

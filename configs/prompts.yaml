@@ -1,0 +1,12 @@
+prompt_splits:
+  pilot_v1:
+    manifest: data/prompts/pilot_v1/manifest.json
+    release_lock: data/prompts/pilot_v1/release.lock.json
+    release_lock_sha256: c434db374a1b169168bcd069b139ef73483e048089c60761980879161f47dde2
+    manifest_sha256: 22d6c1a462f56a48dbf9ba20195bb6c89b4b59d33375aef3594986d776908abe
+    calibration: data/prompts/pilot_v1/calibration.jsonl
+    calibration_sha256: f1d16e63fe92d4339e99c25d9492c21c64a4c02546da3d8c252a00b4ed8e5ee7
+    evaluation: data/prompts/pilot_v1/evaluation.jsonl
+    evaluation_sha256: 19153e4c087cdd635cf46805924c4e2f7c8fe1bd0aa05d223d30185b40670419
+    intended_use: Early effective-rank and correction-validity experiments only.
+    status: frozen

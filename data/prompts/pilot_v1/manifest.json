@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "name": "lora-spec-pilot-v1",
+  "created_at": "2026-06-13",
+  "description": "Frozen domain-balanced pilot prompts for the first effective-rank and correction-validity experiments. This is a pilot split, not the final paper benchmark.",
+  "construction": "Project-authored prompts stratified equally across code, medical, chat, and math. Calibration and evaluation records were written independently, assigned stable IDs, checked for exact normalized-text overlap, and audited under the declared cross-split word n-gram Jaccard policy.",
+  "normalization": "UTF-8 JSONL with LF line endings; one object per line; prompt text is used verbatim after Pydantic schema validation.",
+  "source_license": "MIT (project-authored content)",
+  "overlap_policy": {
+    "ngram_size": 3,
+    "maximum_cross_split_jaccard": 0.1
+  },
+  "splits": {
+    "calibration": {
+      "path": "calibration.jsonl",
+      "sha256": "f1d16e63fe92d4339e99c25d9492c21c64a4c02546da3d8c252a00b4ed8e5ee7",
+      "records": 16,
+      "domains": {
+        "chat": 4,
+        "code": 4,
+        "math": 4,
+        "medical": 4
+      }
+    },
+    "evaluation": {
+      "path": "evaluation.jsonl",
+      "sha256": "19153e4c087cdd635cf46805924c4e2f7c8fe1bd0aa05d223d30185b40670419",
+      "records": 32,
+      "domains": {
+        "chat": 8,
+        "code": 8,
+        "math": 8,
+        "medical": 8
+      }
+    }
+  }
+}

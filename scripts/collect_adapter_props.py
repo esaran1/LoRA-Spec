@@ -7,6 +7,7 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from lora_spec.adapter_props import compute_adapter_properties, compute_distribution_divergence
+from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
 from lora_spec.utils import (
     add_common_args,
     get_config_value,
@@ -24,7 +25,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", type=str, default=None)
     parser.add_argument("--adapted-model", type=str, default=None)
     parser.add_argument("--adapted-adapter-path", type=str, default=None)
-    parser.add_argument("--prompts-file", type=str, default=None)
+    parser.add_argument(
+        "--prompts-file",
+        type=str,
+        default="data/prompts/pilot_v1/calibration.jsonl",
+    )
     parser.add_argument("--magnitude-scale", type=float, default=1.0)
     parser.add_argument("--output-dir", type=str, default="results/adapter_props")
     return parser.parse_args()
@@ -55,12 +60,13 @@ def main() -> None:
         "magnitude_scale": magnitude_scale,
     }
     payload: dict[str, object] = {"properties": scaled_properties}
+    prompts_provenance: dict[str, object] | None = None
     if base_model and prompts_file:
-        prompts = [
-            line.strip()
-            for line in Path(prompts_file).read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        prompts = load_frozen_prompt_texts(prompts_file, expected_split="calibration")
+        prompts_provenance = prompt_file_provenance(
+            prompts_file,
+            expected_split="calibration",
+        )
         tokenizer = AutoTokenizer.from_pretrained(str(base_model), use_fast=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -87,6 +93,7 @@ def main() -> None:
             "adapted_model": adapted_model,
             "adapted_adapter_path": adapted_adapter_path,
             "prompts_file": prompts_file,
+            "prompts_provenance": prompts_provenance,
             "magnitude_scale": magnitude_scale,
         },
         cwd=Path.cwd(),

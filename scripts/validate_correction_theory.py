@@ -12,6 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, P
 from lora_spec.acceptance_theory import empirical_vs_predicted_recovery
 from lora_spec.correction import LowRankCorrection, MeanShiftCorrection
 from lora_spec.metrics import simulate_speculative_decoding
+from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
 from lora_spec.theory import center_logit_shift_rows, collect_logit_shift_dataset
 from lora_spec.utils import (
     add_common_args,
@@ -32,8 +33,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapted-model", type=str, default=None)
     parser.add_argument("--adapted-adapter-path", type=str, default=None)
     parser.add_argument("--draft-model", type=str, default=None)
-    parser.add_argument("--prompts-file", type=str, default=None)
-    parser.add_argument("--eval-prompts-file", type=str, default=None)
+    parser.add_argument(
+        "--prompts-file",
+        type=str,
+        default="data/prompts/pilot_v1/calibration.jsonl",
+    )
+    parser.add_argument(
+        "--eval-prompts-file",
+        type=str,
+        default="data/prompts/pilot_v1/evaluation.jsonl",
+    )
     parser.add_argument("--rank-values", type=str, default="0,1,2,4,8,16")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--speculation-length", type=int, default=4)
@@ -41,13 +50,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", type=str, default="auto")
     parser.add_argument("--output-dir", type=str, default="results/theory")
     return parser.parse_args()
-
-
-def _load_prompts(path: str) -> list[str]:
-    prompts = [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
-    if not prompts:
-        raise ValueError(f"No prompts found in {path}")
-    return prompts
 
 
 def _parse_rank_values(value: str) -> list[int]:
@@ -217,12 +219,20 @@ def main() -> None:
     set_seed(args.seed)
     config_data = resolve_config(args.config, args.override)
 
-    base_model_name = str(get_config_value(config_data, args, "base_model"))
+    base_model_value = get_config_value(config_data, args, "base_model")
     adapted_model_value = get_config_value(config_data, args, "adapted_model")
     adapted_adapter_path_value = get_config_value(config_data, args, "adapted_adapter_path")
-    draft_model_name = str(get_config_value(config_data, args, "draft_model"))
-    prompts_file = str(get_config_value(config_data, args, "prompts_file"))
-    eval_prompts_file = str(get_config_value(config_data, args, "eval_prompts_file") or prompts_file)
+    draft_model_value = get_config_value(config_data, args, "draft_model")
+    prompts_file_value = get_config_value(config_data, args, "prompts_file")
+    if not base_model_value or not draft_model_value or not prompts_file_value:
+        raise ValueError("base_model, draft_model, and prompts_file must be provided")
+    base_model_name = str(base_model_value)
+    draft_model_name = str(draft_model_value)
+    prompts_file = str(prompts_file_value)
+    eval_prompts_file_value = get_config_value(config_data, args, "eval_prompts_file")
+    if not eval_prompts_file_value:
+        raise ValueError("eval_prompts_file must be provided separately from prompts_file")
+    eval_prompts_file = str(eval_prompts_file_value)
     rank_values = _parse_rank_values(str(get_config_value(config_data, args, "rank_values")))
     batch_size = int(get_config_value(config_data, args, "batch_size"))
     speculation_length = int(get_config_value(config_data, args, "speculation_length"))
@@ -231,11 +241,13 @@ def main() -> None:
     output_dir = str(get_config_value(config_data, args, "output_dir"))
     plots_dir = ensure_dir(Path(output_dir) / "plots")
 
-    if not base_model_name or not draft_model_name or not prompts_file:
-        raise ValueError("base_model, draft_model, and prompts_file must be provided")
-
-    calibration_prompts = _load_prompts(prompts_file)
-    eval_prompts = _load_prompts(eval_prompts_file)
+    calibration_prompts = load_frozen_prompt_texts(prompts_file, expected_split="calibration")
+    eval_prompts = load_frozen_prompt_texts(eval_prompts_file, expected_split="evaluation")
+    prompts_provenance = prompt_file_provenance(prompts_file, expected_split="calibration")
+    eval_prompts_provenance = prompt_file_provenance(
+        eval_prompts_file,
+        expected_split="evaluation",
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch_dtype = resolve_torch_dtype(torch_dtype_name, device=device)
 
@@ -391,6 +403,8 @@ def main() -> None:
             "draft_model": draft_model_name,
             "prompts_file": prompts_file,
             "eval_prompts_file": eval_prompts_file,
+            "prompts_provenance": prompts_provenance,
+            "eval_prompts_provenance": eval_prompts_provenance,
             "rank_values": rank_values,
             "batch_size": batch_size,
             "speculation_length": speculation_length,

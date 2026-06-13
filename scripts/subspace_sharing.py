@@ -10,6 +10,7 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
+from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
 from lora_spec.theory import dominant_subspace_basis, subspace_overlap_from_bases
 from lora_spec.utils import (
     add_common_args,
@@ -29,7 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models-config", type=str, default="configs/models.yaml")
     parser.add_argument("--adapters-config", type=str, default="configs/adapters.yaml")
     parser.add_argument("--model-pair", type=str, default=None)
-    parser.add_argument("--prompts-file", type=str, default=None)
+    parser.add_argument(
+        "--prompts-file",
+        type=str,
+        default="data/prompts/pilot_v1/calibration.jsonl",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--overlap-rank", type=int, default=8)
     parser.add_argument("--torch-dtype", type=str, default="auto")
@@ -38,13 +43,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-matrix-gb", type=float, default=2.0)
     parser.add_argument("--output-dir", type=str, default="results/theory")
     return parser.parse_args()
-
-
-def _load_prompts(path: str) -> list[str]:
-    prompts = [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
-    if not prompts:
-        raise ValueError(f"No prompts found in {path}")
-    return prompts
 
 
 def _load_model(model_name: str, device: torch.device, dtype: torch.dtype) -> PreTrainedModel:
@@ -131,8 +129,12 @@ def main() -> None:
 
     models_config = str(get_config_value(config_data, args, "models_config"))
     adapters_config = str(get_config_value(config_data, args, "adapters_config"))
-    model_pair = str(get_config_value(config_data, args, "model_pair"))
-    prompts_file = str(get_config_value(config_data, args, "prompts_file"))
+    model_pair_value = get_config_value(config_data, args, "model_pair")
+    prompts_file_value = get_config_value(config_data, args, "prompts_file")
+    if not model_pair_value or not prompts_file_value:
+        raise ValueError("model_pair and prompts_file must be provided")
+    model_pair = str(model_pair_value)
+    prompts_file = str(prompts_file_value)
     batch_size = int(get_config_value(config_data, args, "batch_size"))
     overlap_rank = int(get_config_value(config_data, args, "overlap_rank"))
     torch_dtype_name = str(get_config_value(config_data, args, "torch_dtype"))
@@ -141,8 +143,6 @@ def main() -> None:
     max_matrix_gb = float(get_config_value(config_data, args, "max_matrix_gb"))
     output_dir = str(get_config_value(config_data, args, "output_dir"))
 
-    if not model_pair or not prompts_file:
-        raise ValueError("model_pair and prompts_file must be provided")
     if overlap_rank < 1:
         raise ValueError("overlap_rank must be positive")
     if projection_dim < overlap_rank:
@@ -154,7 +154,8 @@ def main() -> None:
         raise KeyError(f"Unknown model pair {model_pair}")
     adapters = adapter_payload["adapters"]
     adapter_names = _select_adapters(adapter_payload, model_pair)
-    prompts = _load_prompts(prompts_file)
+    prompts = load_frozen_prompt_texts(prompts_file, expected_split="calibration")
+    prompts_provenance = prompt_file_provenance(prompts_file, expected_split="calibration")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = resolve_torch_dtype(torch_dtype_name, device=device)
     base_model_name = str(model_pairs[model_pair]["target_model"])
@@ -239,6 +240,7 @@ def main() -> None:
             "adapters_config": adapters_config,
             "model_pair": model_pair,
             "prompts_file": prompts_file,
+            "prompts_provenance": prompts_provenance,
             "batch_size": batch_size,
             "overlap_rank": overlap_rank,
             "torch_dtype": torch_dtype_name,
