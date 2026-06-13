@@ -43,6 +43,23 @@ python scripts/verify_prompt_splits.py --verbose
 
 The default `pilot_v1` split contains 16 calibration and 32 held-out evaluation prompts, balanced across code, medical, chat, and math. Its byte-level SHA-256 hashes are pinned in `data/prompts/pilot_v1/manifest.json` and independently locked by `release.lock.json`. Scripts enforce calibration/evaluation roles and reject unregistered files. This pilot is intended to validate the research direction before constructing the final benchmark suite.
 
+Model and adapter identifiers are resolved to immutable Hugging Face commit SHAs at run time and included in the result config hash. Local artifacts are content-hashed. Full-vocabulary comparisons additionally require exact tokenizer vocabulary and special-token equivalence.
+
+Run the paired Phase 1 validation on the frozen evaluation split:
+
+```bash
+python scripts/validate_hypothesis.py \
+  --target-model meta-llama/Meta-Llama-3-8B-Instruct \
+  --draft-model meta-llama/Llama-3.2-1B-Instruct \
+  --adapter-path AdnanRiaz107/CodeLLAMA3-8BI-APPS \
+  --adapter-domain code \
+  --prompts-file data/prompts/pilot_v1/evaluation.jsonl \
+  --measurement-repetitions 3 \
+  --verbose
+```
+
+The baseline/adapted order is randomized within each repetition. Results retain replicate-level acceptance, throughput, and TTFT measurements plus paired 95% confidence intervals.
+
 Measure effective rank of the logit-shift matrix:
 
 ```bash
@@ -51,8 +68,11 @@ python scripts/measure_logit_shift_rank.py \
   --adapters-config configs/adapters.yaml \
   --model-pair llama3_8b_1b \
   --prompts-file data/prompts/pilot_v1/calibration.jsonl \
+  --projection-repetitions 3 \
   --verbose
 ```
+
+When the exact full-vocabulary matrix exceeds the configured memory limit, the script uses independent Gaussian sketches and reports all sketch-level rank estimates and ranges. Those outputs are explicitly marked approximate.
 
 Validate the exact rejection-sampling overlap identity and the residual-logit lower bound against held-out acceptance:
 

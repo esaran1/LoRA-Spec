@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 class ModelPairConfig(BaseModel):
     target_model: str
     draft_model: str
+    target_revision: str | None = None
+    draft_revision: str | None = None
     tensor_parallel_degree: int = Field(1, ge=1)
 
 
@@ -17,6 +19,7 @@ class AdapterConfig(BaseModel):
     domain: str
     epochs: int | None = Field(default=None, ge=1)
     hf_path: str
+    revision: str | None = None
     magnitude_scale: float = Field(1.0, gt=0.0)
     target_model: str | None = None
 
@@ -26,7 +29,9 @@ class ExperimentConfig(BaseModel):
     adapter: AdapterConfig | None = None
     num_prompts: int = Field(..., ge=1)
     dataset: str
+    prompts_file: str | None = None
     seed: int = 7
+    measurement_repetitions: int = Field(3, ge=2)
     speculation_length: int = Field(4, ge=1)
     max_tokens: int = Field(128, ge=1)
     warmup_prompts: int = Field(2, ge=1)

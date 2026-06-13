@@ -10,6 +10,7 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 from lora_spec.adapter_props import compute_adapter_properties, read_adapter_metadata
+from lora_spec.artifacts import resolve_artifact_revision
 from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
 from lora_spec.theory import effective_rank, spectral_analysis
 from lora_spec.utils import (
@@ -42,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", type=str, default="auto")
     parser.add_argument("--rank-estimation-mode", type=str, choices=["auto", "exact", "projected"], default="auto")
     parser.add_argument("--projection-dim", type=int, default=256)
+    parser.add_argument("--projection-repetitions", type=int, default=3)
     parser.add_argument("--max-matrix-gb", type=float, default=2.0)
     parser.add_argument("--output-dir", type=str, default="results/theory")
     parser.add_argument("--plots-dir", type=str, default="results/theory/plots")
@@ -52,13 +54,15 @@ def _load_base_model_and_tokenizer(
     model_name: str,
     device: torch.device,
     torch_dtype: torch.dtype,
+    revision: str | None = None,
 ) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision, use_fast=True)
     tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
+        revision=revision,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
     ).to(device).eval()
@@ -80,13 +84,20 @@ def _load_adapted_model(
     magnitude_scale: float,
     device: torch.device,
     torch_dtype: torch.dtype,
+    base_revision: str | None = None,
+    adapter_revision: str | None = None,
 ) -> PreTrainedModel:
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
+        revision=base_revision,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
     ).to(device).eval()
-    adapted = PeftModel.from_pretrained(base_model, adapter_path).to(device).eval()
+    adapted = PeftModel.from_pretrained(
+        base_model,
+        adapter_path,
+        revision=adapter_revision,
+    ).to(device).eval()
     _apply_lora_scale(adapted, magnitude_scale)
     return adapted
 
@@ -234,6 +245,7 @@ def main() -> None:
     torch_dtype_name = str(get_config_value(config_data, args, "torch_dtype"))
     rank_estimation_mode = str(get_config_value(config_data, args, "rank_estimation_mode"))
     projection_dim = int(get_config_value(config_data, args, "projection_dim"))
+    projection_repetitions = int(get_config_value(config_data, args, "projection_repetitions"))
     max_matrix_gb = float(get_config_value(config_data, args, "max_matrix_gb"))
     output_dir = str(get_config_value(config_data, args, "output_dir"))
     plots_dir = ensure_dir(str(get_config_value(config_data, args, "plots_dir")))
@@ -248,6 +260,8 @@ def main() -> None:
     )
     if not experiments:
         raise ValueError("No experiments matched the requested model/adapter selection")
+    if projection_dim < 2 or projection_repetitions < 2:
+        raise ValueError("projection_dim and projection_repetitions must both be at least 2")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch_dtype = resolve_torch_dtype(torch_dtype_name, device=device)
@@ -257,6 +271,14 @@ def main() -> None:
         adapter_config = dict(experiment["adapter_config"])
         base_model_name = str(model_config["target_model"])
         adapter_path = str(adapter_config["hf_path"])
+        base_artifact = resolve_artifact_revision(
+            base_model_name,
+            revision=model_config.get("target_revision"),
+        )
+        adapter_artifact = resolve_artifact_revision(
+            adapter_path,
+            revision=adapter_config.get("revision"),
+        )
         magnitude_scale = float(adapter_config.get("magnitude_scale", 1.0))
         compatible_target = adapter_config.get("target_model")
         if compatible_target and str(compatible_target) != base_model_name:
@@ -273,6 +295,7 @@ def main() -> None:
             base_model_name,
             device=device,
             torch_dtype=torch_dtype,
+            revision=base_artifact.revision_for_loading,
         )
         row_count = _count_next_token_positions(tokenizer, prompts, batch_size)
         estimated_matrix_gb = (row_count * tokenizer.vocab_size * 4.0) / (1024.0**3)
@@ -285,7 +308,7 @@ def main() -> None:
             generator.manual_seed(args.seed + len(rows))
             projection = torch.randn(
                 tokenizer.vocab_size,
-                projection_dim,
+                projection_dim * projection_repetitions,
                 generator=generator,
                 dtype=torch.float32,
             ) / math.sqrt(float(projection_dim))
@@ -306,8 +329,15 @@ def main() -> None:
                 prompts=prompts,
                 batch_size=batch_size,
             )
-        properties = compute_adapter_properties(adapter_path, base_model=base_model)
-        adapter_metadata = read_adapter_metadata(adapter_path)
+        properties = compute_adapter_properties(
+            adapter_path,
+            base_model=base_model,
+            revision=adapter_artifact.revision_for_loading,
+        )
+        adapter_metadata = read_adapter_metadata(
+            adapter_path,
+            revision=adapter_artifact.revision_for_loading,
+        )
         metadata_rank = adapter_metadata.get("r")
         if metadata_rank is not None and int(metadata_rank) != int(adapter_config["rank"]):
             raise ValueError(
@@ -324,6 +354,8 @@ def main() -> None:
             magnitude_scale=magnitude_scale,
             device=device,
             torch_dtype=torch_dtype,
+            base_revision=base_artifact.revision_for_loading,
+            adapter_revision=adapter_artifact.revision_for_loading,
         )
         if use_projected:
             if projection is None:
@@ -343,8 +375,25 @@ def main() -> None:
                 prompts=prompts,
                 batch_size=batch_size,
             )
-        shift_matrix = adapted_rows - base_rows
-        analysis = spectral_analysis(shift_matrix)
+        combined_shift = adapted_rows - base_rows
+        if use_projected:
+            shift_matrices = list(torch.split(combined_shift, projection_dim, dim=1))
+            analyses = [spectral_analysis(matrix) for matrix in shift_matrices]
+            threshold_ranks = [effective_rank(matrix, threshold=energy_threshold) for matrix in shift_matrices]
+            median_index = sorted(
+                range(len(analyses)),
+                key=lambda index: analyses[index].effective_rank_99,
+            )[len(analyses) // 2]
+            shift_matrix = shift_matrices[median_index]
+            analysis = analyses[median_index]
+        else:
+            shift_matrix = combined_shift
+            analyses = [spectral_analysis(shift_matrix)]
+            threshold_ranks = [effective_rank(shift_matrix, threshold=energy_threshold)]
+        rank_95_estimates = [item.effective_rank_95 for item in analyses]
+        rank_99_estimates = [item.effective_rank_99 for item in analyses]
+        stable_rank_estimates = [item.stable_rank for item in analyses]
+        participation_ratio_estimates = [item.participation_ratio for item in analyses]
         plot_path = analysis.save_spectrum_plot(
             plots_dir / f"{experiment['model_pair_name']}__{experiment['adapter_name']}__spectrum.png",
             title=f"{experiment['model_pair_name']} / {experiment['adapter_name']}",
@@ -358,7 +407,7 @@ def main() -> None:
                 "adapter_epochs": adapter_config.get("epochs"),
                 "adapter_path": adapter_path,
                 "magnitude_scale": magnitude_scale,
-                "effective_rank": effective_rank(shift_matrix, threshold=energy_threshold),
+                "effective_rank": int(round(float(torch.tensor(threshold_ranks).median().item()))),
                 "effective_rank_95": analysis.effective_rank_95,
                 "effective_rank_99": analysis.effective_rank_99,
                 "stable_rank": analysis.stable_rank,
@@ -368,6 +417,21 @@ def main() -> None:
                 "analysis_dimension": int(analysis_input_dim),
                 "rank_estimation_mode": "projected" if use_projected else "exact",
                 "spectrum_is_approximate": bool(use_projected),
+                "projection_repetitions": projection_repetitions if use_projected else 0,
+                "effective_rank_estimates": threshold_ranks,
+                "effective_rank_95_estimates": rank_95_estimates,
+                "effective_rank_99_estimates": rank_99_estimates,
+                "effective_rank_99_range": [min(rank_99_estimates), max(rank_99_estimates)],
+                "stable_rank_estimates": stable_rank_estimates,
+                "stable_rank_range": [
+                    min(stable_rank_estimates),
+                    max(stable_rank_estimates),
+                ],
+                "participation_ratio_estimates": participation_ratio_estimates,
+                "participation_ratio_range": [
+                    min(participation_ratio_estimates),
+                    max(participation_ratio_estimates),
+                ],
                 "logit_gauge": "row_mean_centered_before_projection",
                 "spectral_analysis": {
                     "singular_values": analysis.singular_values,
@@ -379,6 +443,10 @@ def main() -> None:
                     "max_spectral_norm": properties.max_spectral_norm * magnitude_scale,
                     "adapted_parameter_count": properties.adapted_parameter_count,
                     "adapted_parameter_fraction": properties.adapted_parameter_fraction,
+                },
+                "artifact_provenance": {
+                    "base_model": base_artifact.to_dict(),
+                    "adapter": adapter_artifact.to_dict(),
                 },
                 "spectrum_plot": str(plot_path),
                 "notes": experiment["notes"],
@@ -417,7 +485,16 @@ def main() -> None:
             "torch_dtype": torch_dtype_name,
             "rank_estimation_mode": rank_estimation_mode,
             "projection_dim": projection_dim,
+            "projection_repetitions": projection_repetitions,
             "max_matrix_gb": max_matrix_gb,
+            "artifact_provenance_by_experiment": [
+                {
+                    "model_pair_name": row["model_pair_name"],
+                    "adapter_name": row["adapter_name"],
+                    "artifact_provenance": row["artifact_provenance"],
+                }
+                for row in rows
+            ],
         },
         cwd=Path.cwd(),
     )

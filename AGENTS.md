@@ -49,6 +49,10 @@ Research-grade implementation requirements:
 - Every script accepts `--config` YAML plus CLI overrides.
 - Every experiment writes deterministic JSON artifacts with timestamp, config hash, git hash, seed, GPU/runtime metadata, and full config.
 - Calibration and evaluation prompts must come from a versioned frozen split with byte-level SHA-256 hashes. Result configs must include prompt and manifest provenance, and evaluation prompts must never be used to fit a correction.
+- Resolve every Hugging Face model and adapter reference to an immutable commit SHA before loading it. Include requested and resolved revisions in the hashed experiment config; hash local artifacts by content.
+- Any full-vocabulary comparison requires exact tokenizer equivalence: token-to-ID vocabulary, added vocabulary, special-token IDs, and probe encodings must match.
+- Phase 1 systems comparisons use paired repeated measurements with randomized condition order, preserve each replicate, and base go/no-go decisions on confidence intervals rather than one timing run.
+- Random-projection rank analyses use multiple independent sketches and report the sketch-level estimates and ranges. Never present a projected spectrum as exact.
 - Logging uses the Python `logging` module only, never `print()`.
 - No TODOs, placeholders, or skeleton functions.
 - Prefer simple, explicit code over framework-heavy abstraction, but keep the measurement path rigorous and reproducible.

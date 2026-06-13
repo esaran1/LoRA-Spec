@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import importlib.metadata
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -93,6 +94,11 @@ class AcceptanceAccumulator:
         self.raw_decisions.append(drafted_decisions)
         self.bonus_tokens += bonus_tokens
 
+    def add_bonus_tokens(self, count: int) -> None:
+        if count < 0:
+            raise ValueError("bonus token count must be non-negative")
+        self.bonus_tokens += count
+
     def summarize(self) -> AcceptanceMetrics:
         denominator = self.total_drafted_tokens
         numerator = self.accepted_drafted_tokens
@@ -121,52 +127,23 @@ class AcceptanceAccumulator:
         )
 
 
-def _extract_boolean_tensor(payload: Any) -> torch.Tensor | None:
-    if isinstance(payload, torch.Tensor):
-        if payload.dtype == torch.bool and payload.numel() > 0:
-            return payload
-        if payload.dtype in {torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}:
-            unique_values = payload.unique()
-            if unique_values.numel() <= 2 and set(unique_values.detach().cpu().tolist()).issubset({0, 1}):
-                return payload.bool()
-        return None
-    if isinstance(payload, dict):
-        for key in ("accepted", "accept_mask", "accepted_mask", "bonus_mask"):
-            if key in payload:
-                extracted = _extract_boolean_tensor(payload[key])
-                if extracted is not None:
-                    return extracted
-        for value in payload.values():
-            extracted = _extract_boolean_tensor(value)
-            if extracted is not None:
-                return extracted
-        return None
-    if isinstance(payload, (list, tuple)):
-        for value in payload:
-            extracted = _extract_boolean_tensor(value)
-            if extracted is not None:
-                return extracted
-    return None
-
-
 def _record_tensor(
     accumulator: AcceptanceAccumulator,
     tensor: torch.Tensor,
-    bonus_enabled: bool = False,
 ) -> None:
     data = tensor.detach().cpu()
     if data.ndim == 0:
         decision = bool(data.item())
-        accumulator.record([decision], bonus_tokens=int(bonus_enabled and decision))
+        accumulator.record([decision])
         return
     if data.ndim == 1:
         decisions = [bool(value) for value in data.tolist()]
-        accumulator.record(decisions, bonus_tokens=int(bonus_enabled and all(decisions)))
+        accumulator.record(decisions)
         return
     flattened = data.reshape(-1, data.shape[-1])
     for row in flattened:
         decisions = [bool(value) for value in row.tolist()]
-        accumulator.record(decisions, bonus_tokens=int(bonus_enabled and all(decisions)))
+        accumulator.record(decisions)
 
 
 def _wrap_acceptance_method(
@@ -174,26 +151,56 @@ def _wrap_acceptance_method(
     accumulator: AcceptanceAccumulator,
     restored: list[tuple[Any, str, Any]],
 ) -> None:
-    attribute_name = "_get_accepted"
-    original = getattr(rejection_sampler_class, attribute_name, None)
-    if original is None or not callable(original):
+    accepted_attribute = "_get_accepted"
+    original_accepted = getattr(rejection_sampler_class, accepted_attribute, None)
+    original_forward = getattr(rejection_sampler_class, "forward", None)
+    if original_accepted is None or not callable(original_accepted):
         raise RuntimeError("Installed vLLM RejectionSampler does not expose _get_accepted")
+    if original_forward is None or not callable(original_forward):
+        raise RuntimeError("Installed vLLM RejectionSampler does not expose forward")
 
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
-        result = original(*args, **kwargs)
-        decisions = _extract_boolean_tensor(result)
-        if decisions is None:
+    def wrapped_accepted(*args: Any, **kwargs: Any) -> Any:
+        result = original_accepted(*args, **kwargs)
+        if not isinstance(result, torch.Tensor) or result.dtype != torch.bool or result.numel() == 0:
             raise RuntimeError("vLLM RejectionSampler._get_accepted did not return a boolean mask")
-        sampler = args[0] if args else None
-        bonus_enabled = not bool(getattr(sampler, "_disable_bonus_tokens", True))
-        _record_tensor(accumulator, decisions, bonus_enabled=bonus_enabled)
+        _record_tensor(accumulator, result)
         return result
 
-    setattr(rejection_sampler_class, attribute_name, wrapped)
-    restored.append((rejection_sampler_class, attribute_name, original))
+    def wrapped_forward(*args: Any, **kwargs: Any) -> Any:
+        result = original_forward(*args, **kwargs)
+        draft_token_ids = kwargs.get("draft_token_ids")
+        if draft_token_ids is None and len(args) >= 5:
+            draft_token_ids = args[4]
+        if not isinstance(result, torch.Tensor) or not isinstance(draft_token_ids, torch.Tensor):
+            raise RuntimeError("vLLM RejectionSampler.forward returned an unsupported structure")
+        bonus_width = result.shape[-1] - draft_token_ids.shape[-1]
+        if bonus_width < 0:
+            raise RuntimeError("vLLM sampler output is shorter than the draft sequence")
+        if bonus_width > 1:
+            raise RuntimeError(
+                "Pinned vLLM sampler contract permits at most one bonus-token column"
+            )
+        if bonus_width > 0:
+            bonus_tokens = int((result[..., -bonus_width:] >= 0).sum().item())
+            accumulator.add_bonus_tokens(bonus_tokens)
+        return result
+
+    setattr(rejection_sampler_class, accepted_attribute, wrapped_accepted)
+    setattr(rejection_sampler_class, "forward", wrapped_forward)
+    restored.append((rejection_sampler_class, accepted_attribute, original_accepted))
+    restored.append((rejection_sampler_class, "forward", original_forward))
 
 
 def _resolve_vllm_rejection_sampler() -> tuple[type[Any], str]:
+    try:
+        vllm_version = importlib.metadata.version("vllm")
+    except importlib.metadata.PackageNotFoundError:
+        vllm_version = None
+    if vllm_version is not None and vllm_version != "0.5.3.post1":
+        raise RuntimeError(
+            "Acceptance instrumentation is validated only for vllm==0.5.3.post1; "
+            f"installed version is {vllm_version}",
+        )
     candidates = (
         "vllm.model_executor.layers.rejection_sampler",
         "vllm.spec_decode.rejection_sampler",

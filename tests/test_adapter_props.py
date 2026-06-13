@@ -30,8 +30,34 @@ class TinyTokenizer:
         self.vocab_size = vocab_size
         self.pad_token = "<pad>"
         self.eos_token = "<eos>"
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+        self.bos_token_id = None
+        self.unk_token_id = None
+        self.mask_token_id = None
+        self.sep_token_id = None
+        self.cls_token_id = None
 
-    def __call__(self, texts: list[str], return_tensors: str, padding: bool, truncation: bool):
+    def __len__(self) -> int:
+        return self.vocab_size
+
+    def get_vocab(self) -> dict[str, int]:
+        return {str(index): index for index in range(self.vocab_size)}
+
+    def get_added_vocab(self) -> dict[str, int]:
+        return {}
+
+    def __call__(
+        self,
+        texts: list[str] | str,
+        return_tensors: str | None = None,
+        padding: bool = False,
+        truncation: bool = False,
+        add_special_tokens: bool = True,
+    ):
+        _ = return_tensors, padding, truncation, add_special_tokens
+        if isinstance(texts, str):
+            return {"input_ids": [int(piece) % self.vocab_size for piece in texts.split()]}
         tokenized = []
         for text in texts:
             tokenized.append([int(piece) % self.vocab_size for piece in text.split()])

@@ -10,6 +10,7 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
+from lora_spec.artifacts import resolve_artifact_revision
 from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
 from lora_spec.theory import dominant_subspace_basis, subspace_overlap_from_bases
 from lora_spec.utils import (
@@ -45,16 +46,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_model(model_name: str, device: torch.device, dtype: torch.dtype) -> PreTrainedModel:
+def _load_model(
+    model_name: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    revision: str | None = None,
+) -> PreTrainedModel:
     return AutoModelForCausalLM.from_pretrained(
         model_name,
+        revision=revision,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
     ).to(device).eval()
 
 
-def _load_tokenizer(model_name: str) -> PreTrainedTokenizerBase:
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+def _load_tokenizer(model_name: str, revision: str | None = None) -> PreTrainedTokenizerBase:
+    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision, use_fast=True)
     tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -159,7 +166,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = resolve_torch_dtype(torch_dtype_name, device=device)
     base_model_name = str(model_pairs[model_pair]["target_model"])
-    tokenizer = _load_tokenizer(base_model_name)
+    base_artifact = resolve_artifact_revision(
+        base_model_name,
+        revision=model_pairs[model_pair].get("target_revision"),
+    )
+    tokenizer = _load_tokenizer(base_model_name, revision=base_artifact.revision_for_loading)
     row_count = _count_rows(tokenizer, prompts, batch_size)
     estimated_dense_gb = row_count * tokenizer.vocab_size * 4.0 / (1024.0**3)
     use_projection = rank_estimation_mode == "projected" or (
@@ -177,7 +188,12 @@ def main() -> None:
         ) / math.sqrt(float(projection_dim))
 
     logger.info("Collecting base logits for %s using %s analysis", model_pair, "projected" if use_projection else "exact")
-    base_model = _load_model(base_model_name, device, dtype)
+    base_model = _load_model(
+        base_model_name,
+        device,
+        dtype,
+        revision=base_artifact.revision_for_loading,
+    )
     base_rows = _collect_rows(base_model, tokenizer, prompts, batch_size, row_count, projection)
     del base_model
     if torch.cuda.is_available():
@@ -185,21 +201,33 @@ def main() -> None:
 
     bases: dict[str, torch.Tensor] = {}
     adapter_sources: dict[str, str] = {}
+    adapter_provenance: dict[str, dict[str, str | None]] = {}
     for adapter_name in adapter_names:
         adapter_config = adapters[adapter_name]
         compatible_target = adapter_config.get("target_model")
         if compatible_target and str(compatible_target) != base_model_name:
             raise ValueError(f"Adapter {adapter_name} targets {compatible_target}, not {base_model_name}")
         logger.info("Computing dominant subspace for %s", adapter_name)
-        adapted_model = PeftModel.from_pretrained(
-            _load_model(base_model_name, device, dtype),
+        artifact = resolve_artifact_revision(
             str(adapter_config["hf_path"]),
+            revision=adapter_config.get("revision"),
+        )
+        adapted_model = PeftModel.from_pretrained(
+            _load_model(
+                base_model_name,
+                device,
+                dtype,
+                revision=base_artifact.revision_for_loading,
+            ),
+            str(adapter_config["hf_path"]),
+            revision=artifact.revision_for_loading,
         ).to(device).eval()
         _apply_lora_scale(adapted_model, float(adapter_config.get("magnitude_scale", 1.0)))
         adapted_rows = _collect_rows(adapted_model, tokenizer, prompts, batch_size, row_count, projection)
         shift = adapted_rows - base_rows
         bases[adapter_name] = dominant_subspace_basis(shift, rank=overlap_rank)
         adapter_sources[adapter_name] = str(adapter_config["hf_path"])
+        adapter_provenance[adapter_name] = artifact.to_dict()
         del adapted_rows, shift, adapted_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -230,6 +258,10 @@ def main() -> None:
         "estimated_dense_matrix_gb": estimated_dense_gb,
         "logit_gauge": "row_mean_centered_before_projection",
         "unique_adapter_sources": len(set(adapter_sources.values())),
+        "artifact_provenance": {
+            "base_model": base_artifact.to_dict(),
+            "adapters": adapter_provenance,
+        },
     }
     output = write_json_result(
         payload=payload,
@@ -247,6 +279,10 @@ def main() -> None:
             "rank_estimation_mode": rank_estimation_mode,
             "projection_dim": projection_dim,
             "max_matrix_gb": max_matrix_gb,
+            "artifact_provenance": {
+                "base_model": base_artifact.to_dict(),
+                "adapters": adapter_provenance,
+            },
         },
         cwd=Path.cwd(),
     )

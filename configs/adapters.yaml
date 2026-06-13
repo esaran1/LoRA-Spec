@@ -9,6 +9,7 @@ adapters:
     domain: medical
     epochs: null
     hf_path: bootscoder/Llama-3-Medical-8B-SFT-LoRA
+    revision: null
     target_model: meta-llama/Meta-Llama-3-8B
     magnitude_scale: 0.25
   medical_rank64_scale050:
@@ -35,6 +36,7 @@ adapters:
     domain: code
     epochs: null
     hf_path: AdnanRiaz107/CodeLLAMA3-8BI-APPS
+    revision: null
     target_model: meta-llama/Meta-Llama-3-8B-Instruct
     magnitude_scale: 0.25
   code_rank16_scale050:
@@ -61,6 +63,7 @@ adapters:
     domain: chat
     epochs: null
     hf_path: grimjim/Llama-3-Instruct-Nephilim-v3-LoRA-8B
+    revision: null
     target_model: grimjim/llama-3-Nephilim-v3-8B
     magnitude_scale: 0.25
   chat_rank32_scale050:

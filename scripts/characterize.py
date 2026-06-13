@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import Any
 
+from lora_spec.artifacts import materialize_artifact, resolve_artifact_revision
 from lora_spec.config import AdapterConfig, ExperimentConfig, ModelPairConfig
+from lora_spec.prompts import prompt_file_provenance, resolve_registered_prompt_split
 from lora_spec.utils import (
     add_common_args,
     canonical_json,
@@ -26,8 +29,14 @@ def parse_args() -> argparse.Namespace:
     add_common_args(parser)
     parser.add_argument("--models-config", type=str, default="configs/models.yaml")
     parser.add_argument("--adapters-config", type=str, default="configs/adapters.yaml")
-    parser.add_argument("--dataset", type=str, default="tatsu-lab/alpaca")
+    parser.add_argument("--dataset", type=str, default="lora-spec-pilot-v1/evaluation")
+    parser.add_argument(
+        "--prompts-file",
+        type=str,
+        default="data/prompts/pilot_v1/evaluation.jsonl",
+    )
     parser.add_argument("--num-prompts", type=int, default=32)
+    parser.add_argument("--measurement-repetitions", type=int, default=3)
     parser.add_argument("--speculation-length", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
@@ -122,12 +131,16 @@ def _run_config_fingerprint(
     experiment: ExperimentConfig,
     model_pair_name: str,
     adapter_name: str,
+    prompt_metadata: dict[str, Any],
+    artifact_provenance: dict[str, Any],
 ) -> str:
     return compute_config_hash(
         {
             "model_pair_name": model_pair_name,
             "adapter_name": adapter_name,
             "experiment": experiment.model_dump(mode="json"),
+            "prompt_metadata": prompt_metadata,
+            "artifact_provenance": artifact_provenance,
         }
     )
 
@@ -141,11 +154,17 @@ def main() -> None:
     logger = setup_logging(args.verbose, "characterize")
     set_seed(args.seed)
     config_data = resolve_config(args.config, args.override)
+    seed = int(get_config_value(config_data, args, "seed"))
+    set_seed(seed)
 
     models_config = str(get_config_value(config_data, args, "models_config"))
     adapters_config = str(get_config_value(config_data, args, "adapters_config"))
     dataset = str(get_config_value(config_data, args, "dataset"))
+    prompts_file = str(get_config_value(config_data, args, "prompts_file"))
     num_prompts = int(get_config_value(config_data, args, "num_prompts"))
+    measurement_repetitions = int(
+        get_config_value(config_data, args, "measurement_repetitions"),
+    )
     speculation_length = int(get_config_value(config_data, args, "speculation_length"))
     max_tokens = int(get_config_value(config_data, args, "max_tokens"))
     gpu_memory_utilization = float(get_config_value(config_data, args, "gpu_memory_utilization"))
@@ -166,6 +185,27 @@ def main() -> None:
     if not manifest:
         raise ValueError("No characterization runs matched the requested manifest and filters")
 
+    registered_prompts = resolve_registered_prompt_split(
+        prompts_file,
+        expected_split="evaluation",
+    )
+    if num_prompts > len(registered_prompts.records):
+        raise ValueError(
+            f"Requested {num_prompts} prompts, but frozen evaluation split has "
+            f"{len(registered_prompts.records)}",
+        )
+    selected_indices = list(range(len(registered_prompts.records)))
+    random.Random(seed).shuffle(selected_indices)
+    selected_records = [
+        registered_prompts.records[index] for index in selected_indices[:num_prompts]
+    ]
+    prompts = [record.text for record in selected_records]
+    prompt_metadata = {
+        **prompt_file_provenance(prompts_file, expected_split="evaluation"),
+        "selected_prompt_ids": [record.id for record in selected_records],
+        "selection_seed": seed,
+    }
+
     run_records: list[dict[str, Any]] = []
     for entry in manifest:
         model_pair_name = entry["model_pair_name"]
@@ -181,24 +221,62 @@ def main() -> None:
             )
         logger.info("Preparing characterization for %s x %s", model_pair_name, adapter_name)
 
+        target_artifact = resolve_artifact_revision(
+            str(model_values["target_model"]),
+            revision=model_values.get("target_revision"),
+        )
+        draft_artifact = resolve_artifact_revision(
+            str(model_values["draft_model"]),
+            revision=model_values.get("draft_revision"),
+        )
+        adapter_artifact = resolve_artifact_revision(
+            str(adapter_values["hf_path"]),
+            revision=adapter_values.get("revision"),
+        )
+        model_values["target_revision"] = target_artifact.resolved_revision
+        model_values["draft_revision"] = draft_artifact.resolved_revision
+        adapter_values["revision"] = adapter_artifact.resolved_revision
+
         experiment = ExperimentConfig(
             model_pair=ModelPairConfig(**model_values),
             adapter=AdapterConfig(**adapter_values),
             num_prompts=num_prompts,
             dataset=dataset,
-            seed=args.seed,
+            prompts_file=prompts_file,
+            seed=seed,
+            measurement_repetitions=measurement_repetitions,
             speculation_length=speculation_length,
             max_tokens=max_tokens,
             gpu_memory_utilization=gpu_memory_utilization,
         )
-        run_fingerprint = _run_config_fingerprint(experiment, model_pair_name, adapter_name)
+        artifact_provenance = {
+            "target_model": target_artifact.to_dict(),
+            "draft_model": draft_artifact.to_dict(),
+            "adapter": adapter_artifact.to_dict(),
+        }
+        run_fingerprint = _run_config_fingerprint(
+            experiment,
+            model_pair_name,
+            adapter_name,
+            prompt_metadata,
+            artifact_provenance,
+        )
         run_path = runs_dir / f"{model_pair_name}__{adapter_name}__{run_fingerprint}.json"
 
         if resume and run_path.exists():
             logger.info("Resuming from existing run artifact %s", run_path.name)
             payload = _load_existing_run(run_path)
         else:
-            result = run_validation(experiment, adapter_path=adapter_values["hf_path"], logger=logger)
+            result = run_validation(
+                experiment,
+                adapter_path=materialize_artifact(adapter_artifact),
+                prompts=prompts,
+                prompt_metadata=prompt_metadata,
+                artifact_provenance=artifact_provenance,
+                target_load_path=materialize_artifact(target_artifact),
+                draft_load_path=materialize_artifact(draft_artifact),
+                logger=logger,
+            )
             payload = {
                 "model_pair_name": model_pair_name,
                 "adapter_name": adapter_name,
@@ -206,6 +284,8 @@ def main() -> None:
                 "tags": entry.get("tags", []),
                 "result": result["summary"],
                 "experiment": result["experiment"],
+                "prompt_metadata": prompt_metadata,
+                "artifact_provenance": artifact_provenance,
             }
             run_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
             logger.info("Wrote run artifact to %s", run_path)
@@ -218,7 +298,10 @@ def main() -> None:
         "summary": {
             "num_runs": len(run_records),
             "dataset": dataset,
+            "prompts_file": prompts_file,
+            "prompt_metadata": prompt_metadata,
             "num_prompts": num_prompts,
+            "measurement_repetitions": measurement_repetitions,
         },
     }
     output = write_json_result(
@@ -229,7 +312,10 @@ def main() -> None:
             "models_config": models_config,
             "adapters_config": adapters_config,
             "dataset": dataset,
+            "prompts_file": prompts_file,
+            "prompt_metadata": prompt_metadata,
             "num_prompts": num_prompts,
+            "measurement_repetitions": measurement_repetitions,
             "speculation_length": speculation_length,
             "max_tokens": max_tokens,
             "gpu_memory_utilization": gpu_memory_utilization,

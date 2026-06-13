@@ -25,8 +25,11 @@ Every script accepts `--seed`, writes a JSON artifact with:
 - git hash
 - timestamp
 - runtime metadata including GPU type when CUDA is available
+- requested and resolved Hugging Face revisions, or a content hash for local artifacts
 
 Use a fixed prompt file for exact reruns of the theory experiments.
+
+Remote model and adapter names are resolved to immutable Hub commit SHAs before model construction. The resolved SHA, prompt hashes, selected prompt IDs, and measurement settings participate in the experiment config hash. Reproduction should use the resolved revisions recorded in the artifact, not the current repository head.
 
 Verify the checked-in frozen pilot split and its hashes before running:
 
@@ -42,9 +45,11 @@ The authoritative manifest is `data/prompts/pilot_v1/manifest.json`, independent
 - `logit_acceptance_lower_bound` is a certified lower bound derived from the residual-logit span, not a fitted predictor.
 - `greedy_proxy_acceptance_rate` is a sequence-level diagnostic and must not be presented as standard rejection-sampling acceptance.
 - Results with `spectrum_is_approximate` or `subspace_is_approximate` use a shared random vocabulary projection. Report the projection dimension and seed.
+- Projected effective-rank results use multiple independent Gaussian sketches. Report every sketch estimate and its range; do not treat the representative plotted spectrum as exact uncertainty-free evidence.
 - Rank and correction analyses use row-mean-centered logits to remove the softmax-invariant scalar gauge.
 - Correction calibration labels are always computed from `adapted target - base target`; draft logits or hidden states are only application-time features.
 - Per-position vLLM acceptance is conditional on reaching that drafted position. `acceptance_by_depth[d]` is the fraction of eligible speculative steps whose first `d + 1` proposals all survive.
+- Phase 1 comparisons use randomized paired condition order. Report the replicate-level measurements and paired confidence intervals; the pooled counts are descriptive summaries, not independent replicates.
 
 ## Runtime Scope
 

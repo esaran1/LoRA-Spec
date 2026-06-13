@@ -9,7 +9,15 @@ import torch
 import torch.nn.functional as F
 from peft import PeftModel
 from safetensors.torch import load_file as load_safetensors
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
+
+from .artifacts import tokenizers_are_equivalent
 
 try:
     from huggingface_hub import snapshot_download
@@ -39,13 +47,17 @@ class CalibrationDivergence:
     per_prompt_js: list[float]
 
 
-def _resolve_adapter_path(adapter_path: str | Path) -> Path:
+def _resolve_adapter_path(adapter_path: str | Path, revision: str | None = None) -> Path:
     path = Path(adapter_path)
     if path.exists():
         return path
     if snapshot_download is None:
         raise FileNotFoundError(f"Adapter path does not exist locally: {adapter_path}")
-    downloaded = snapshot_download(repo_id=str(adapter_path), allow_patterns=["*.json", "*.bin", "*.safetensors"])
+    downloaded = snapshot_download(
+        repo_id=str(adapter_path),
+        revision=revision,
+        allow_patterns=["*.json", "*.bin", "*.safetensors"],
+    )
     return Path(downloaded)
 
 
@@ -80,8 +92,11 @@ def _normalize_key(key: str, marker: str) -> str:
     return key
 
 
-def load_lora_matrices(adapter_path: str | Path) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-    resolved_path = _resolve_adapter_path(adapter_path)
+def load_lora_matrices(
+    adapter_path: str | Path,
+    revision: str | None = None,
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    resolved_path = _resolve_adapter_path(adapter_path, revision=revision)
     state_dict = _load_state_dict(_find_adapter_weights(resolved_path))
     matrices_a: dict[str, torch.Tensor] = {}
     matrices_b: dict[str, torch.Tensor] = {}
@@ -96,8 +111,8 @@ def load_lora_matrices(adapter_path: str | Path) -> dict[str, tuple[torch.Tensor
     return {key: (matrices_b[key], matrices_a[key]) for key in common_keys}
 
 
-def _load_adapter_config(adapter_path: str | Path) -> dict[str, Any]:
-    resolved_path = _resolve_adapter_path(adapter_path)
+def _load_adapter_config(adapter_path: str | Path, revision: str | None = None) -> dict[str, Any]:
+    resolved_path = _resolve_adapter_path(adapter_path, revision=revision)
     config_path = resolved_path / "adapter_config.json"
     if not config_path.exists():
         raise FileNotFoundError(f"LoRA adapter config is required to compute effective BA scaling: {config_path}")
@@ -141,13 +156,16 @@ def _infer_base_parameter_count(
         return 0
     if isinstance(base_model, torch.nn.Module):
         return sum(parameter.numel() for parameter in base_model.parameters())
-    model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=torch.float32)
+    config = AutoConfig.from_pretrained(base_model)
     try:
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float32)
         return sum(parameter.numel() for parameter in model.parameters())
-    finally:
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not infer the base-model parameter count without loading weights; "
+            "pass an instantiated base model instead"
+        ) from exc
 
 
 def _low_rank_product_singular_values(
@@ -170,9 +188,10 @@ def _low_rank_product_singular_values(
 def compute_adapter_properties(
     adapter_path: str | Path,
     base_model: str | torch.nn.Module | None = None,
+    revision: str | None = None,
 ) -> AdapterProperties:
-    matrices = load_lora_matrices(adapter_path)
-    adapter_config = _load_adapter_config(adapter_path)
+    matrices = load_lora_matrices(adapter_path, revision=revision)
+    adapter_config = _load_adapter_config(adapter_path, revision=revision)
     layer_frobenius_norms: dict[str, float] = {}
     layer_spectral_norms: dict[str, float] = {}
     layer_weight_norm_distribution: dict[str, float] = {}
@@ -293,8 +312,10 @@ def compute_distribution_divergence(
         tokenizer=adapted_tokenizer or tokenizer,
         device=device or next(base.parameters()).device,
     )
-    if base_tokenizer.vocab_size != adapted_tokenizer.vocab_size:
-        raise ValueError("Base and adapted tokenizer vocabularies must match for KL/JSD comparison")
+    if not tokenizers_are_equivalent(base_tokenizer, adapted_tokenizer, prompts):
+        raise ValueError(
+            "Base and adapted tokenizers must be exactly equivalent for KL/JSD comparison"
+        )
 
     per_prompt_kl: list[float] = []
     per_prompt_js: list[float] = []
@@ -339,8 +360,11 @@ def compute_distribution_divergence(
     )
 
 
-def read_adapter_metadata(adapter_path: str | Path) -> dict[str, Any]:
-    resolved = _resolve_adapter_path(adapter_path)
+def read_adapter_metadata(
+    adapter_path: str | Path,
+    revision: str | None = None,
+) -> dict[str, Any]:
+    resolved = _resolve_adapter_path(adapter_path, revision=revision)
     metadata_path = resolved / "adapter_config.json"
     if not metadata_path.exists():
         return {}

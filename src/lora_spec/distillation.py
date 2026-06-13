@@ -10,6 +10,7 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
+from .artifacts import tokenizers_are_equivalent
 from .utils import resolve_torch_dtype, set_seed
 
 
@@ -106,29 +107,6 @@ def _full_vocab_kl(
     return (token_kl * mask).sum() / mask.sum().clamp_min(1.0)
 
 
-def _tokenizers_are_compatible(
-    draft_tokenizer: PreTrainedTokenizerBase,
-    target_tokenizer: PreTrainedTokenizerBase,
-    prompts: list[str],
-) -> bool:
-    if draft_tokenizer.vocab_size != target_tokenizer.vocab_size:
-        return False
-    special_id_fields = ("pad_token_id", "eos_token_id", "bos_token_id", "unk_token_id")
-    for field in special_id_fields:
-        if getattr(draft_tokenizer, field, None) != getattr(target_tokenizer, field, None):
-            return False
-    if hasattr(draft_tokenizer, "get_vocab") and hasattr(target_tokenizer, "get_vocab"):
-        if draft_tokenizer.get_vocab() != target_tokenizer.get_vocab():
-            return False
-    probe_prompts = prompts[: min(len(prompts), 4)] or ["Compatibility probe"]
-    for prompt in probe_prompts:
-        draft_ids = draft_tokenizer(prompt, add_special_tokens=True)["input_ids"]
-        target_ids = target_tokenizer(prompt, add_special_tokens=True)["input_ids"]
-        if draft_ids != target_ids:
-            return False
-    return True
-
-
 def train_micro_lora_adapter(
     draft_model: str | PreTrainedModel,
     target_model: str | PreTrainedModel,
@@ -159,7 +137,7 @@ def train_micro_lora_adapter(
     if draft_tokenizer is None or target_tokenizer is None:
         raise ValueError("Tokenizers must be available for both draft and target models")
     prompt_probe = list(prompts[: min(len(prompts), 4)]) if isinstance(prompts, list) else ["Compatibility probe"]
-    if not _tokenizers_are_compatible(draft_tokenizer, target_tokenizer, prompt_probe):
+    if not tokenizers_are_equivalent(draft_tokenizer, target_tokenizer, prompt_probe):
         raise ValueError(
             "Draft and target tokenizers must be tokenization-compatible for full-vocabulary KL distillation",
         )

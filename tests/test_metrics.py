@@ -14,6 +14,28 @@ from lora_spec.metrics import (
 )
 
 
+def _install_fake_vllm(
+    monkeypatch: pytest.MonkeyPatch,
+    rejection_module: types.ModuleType,
+) -> None:
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor",
+        types.ModuleType("vllm.model_executor"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers",
+        types.ModuleType("vllm.model_executor.layers"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.rejection_sampler",
+        rejection_module,
+    )
+
+
 def test_acceptance_accumulator_accounts_for_bonus_token() -> None:
     accumulator = AcceptanceAccumulator(speculation_length=3)
     accumulator.record([True, True, True], bonus_tokens=1)
@@ -37,18 +59,22 @@ def test_bonus_token_does_not_inflate_draft_acceptance() -> None:
     assert summary.overall_acceptance_rate == pytest.approx(0.5)
 
 
-def test_patch_vllm_rejection_sampler_collects_boolean_masks() -> None:
+def test_patch_vllm_rejection_sampler_collects_boolean_masks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     rejection_module = types.ModuleType("vllm.model_executor.layers.rejection_sampler")
 
     class RejectionSampler:
         def _get_accepted(self) -> torch.Tensor:
-            return torch.tensor([[1, 0, 1]], dtype=torch.int64)
+            return torch.tensor([[True, False, True]])
+
+        def forward(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
+            decisions = self._get_accepted()
+            bonus = torch.tensor([[-1]], dtype=draft_token_ids.dtype)
+            return torch.cat([torch.where(decisions, draft_token_ids, -1), bonus], dim=-1)
 
     rejection_module.RejectionSampler = RejectionSampler
-    sys.modules["vllm"] = types.ModuleType("vllm")
-    sys.modules["vllm.model_executor"] = types.ModuleType("vllm.model_executor")
-    sys.modules["vllm.model_executor.layers"] = types.ModuleType("vllm.model_executor.layers")
-    sys.modules["vllm.model_executor.layers.rejection_sampler"] = rejection_module
+    _install_fake_vllm(monkeypatch, rejection_module)
 
     sampler = RejectionSampler()
     with patch_vllm_rejection_sampler(speculation_length=3) as (accumulator, backend):
@@ -62,7 +88,7 @@ def test_patch_vllm_rejection_sampler_collects_boolean_masks() -> None:
     assert summary.acceptance_by_depth == [1.0, 0.0, 0.0]
 
 
-def test_collect_speculative_metrics_infers_timing() -> None:
+def test_collect_speculative_metrics_infers_timing(monkeypatch: pytest.MonkeyPatch) -> None:
     class DummyOutputItem:
         token_ids = [1, 2, 3]
         text = "abc"
@@ -81,11 +107,13 @@ def test_collect_speculative_metrics_infers_timing() -> None:
         def _get_accepted(self) -> torch.Tensor:
             return torch.tensor([True, False, True])
 
+        def forward(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
+            decisions = self._get_accepted().view(1, -1)
+            bonus = torch.tensor([[-1]], dtype=draft_token_ids.dtype)
+            return torch.cat([torch.where(decisions, draft_token_ids, -1), bonus], dim=-1)
+
     rejection_module.RejectionSampler = RejectionSampler
-    sys.modules["vllm"] = types.ModuleType("vllm")
-    sys.modules["vllm.model_executor"] = types.ModuleType("vllm.model_executor")
-    sys.modules["vllm.model_executor.layers"] = types.ModuleType("vllm.model_executor.layers")
-    sys.modules["vllm.model_executor.layers.rejection_sampler"] = rejection_module
+    _install_fake_vllm(monkeypatch, rejection_module)
 
     def generate() -> list[DummyOutput]:
         RejectionSampler()._get_accepted()
@@ -96,6 +124,45 @@ def test_collect_speculative_metrics_infers_timing() -> None:
     assert metrics.timing.total_generated_tokens == 3
     assert metrics.timing.ttft_ms == pytest.approx(50.0)
     assert metrics.instrumentation_backend.endswith("RejectionSampler._get_accepted")
+
+
+def test_patch_vllm_rejection_sampler_observes_bonus_tokens_from_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejection_module = types.ModuleType("vllm.model_executor.layers.rejection_sampler")
+
+    class RejectionSampler:
+        def _get_accepted(self) -> torch.Tensor:
+            return torch.tensor([[True, True]])
+
+        def forward(
+            self,
+            target_probs: torch.Tensor,
+            bonus_token_ids: torch.Tensor,
+            draft_probs: torch.Tensor,
+            draft_token_ids: torch.Tensor,
+            generators: list[object],
+        ) -> torch.Tensor:
+            _ = target_probs, bonus_token_ids, draft_probs, generators
+            accepted = self._get_accepted()
+            bonus = torch.tensor([[7]], dtype=draft_token_ids.dtype)
+            return torch.cat([torch.where(accepted, draft_token_ids, -1), bonus], dim=-1)
+
+    rejection_module.RejectionSampler = RejectionSampler
+    _install_fake_vllm(monkeypatch, rejection_module)
+
+    sampler = RejectionSampler()
+    with patch_vllm_rejection_sampler(speculation_length=2) as (accumulator, _):
+        sampler.forward(
+            torch.empty(1, 2, 8),
+            torch.tensor([[7]]),
+            torch.empty(1, 2, 8),
+            torch.tensor([[3, 4]], dtype=torch.long),
+            [None],
+        )
+    summary = accumulator.summarize()
+    assert summary.accepted_drafted_tokens == 2
+    assert summary.bonus_tokens == 1
 
 
 def test_simulate_speculative_decoding_tracks_acceptance_and_bonus_tokens() -> None:

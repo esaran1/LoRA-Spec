@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
+from lora_spec.artifacts import resolve_artifact_revision, tokenizers_are_equivalent
 from lora_spec.correction import ContextDependentCorrection, LowRankCorrection, MeanShiftCorrection
 from lora_spec.metrics import simulate_speculative_decoding
 from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
@@ -33,9 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate theory-grounded analytical corrections.")
     add_common_args(parser)
     parser.add_argument("--base-model", type=str, default=None)
+    parser.add_argument("--base-revision", type=str, default=None)
     parser.add_argument("--adapted-model", type=str, default=None)
+    parser.add_argument("--adapted-revision", type=str, default=None)
     parser.add_argument("--adapted-adapter-path", type=str, default=None)
+    parser.add_argument("--adapter-revision", type=str, default=None)
     parser.add_argument("--draft-model", type=str, default=None)
+    parser.add_argument("--draft-revision", type=str, default=None)
     parser.add_argument(
         "--prompts-file",
         type=str,
@@ -60,8 +65,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_tokenizer(model_name: str) -> PreTrainedTokenizerBase:
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+def _load_tokenizer(model_name: str, revision: str | None = None) -> PreTrainedTokenizerBase:
+    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision, use_fast=True)
     tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -72,9 +77,11 @@ def _load_model(
     model_name: str,
     device: torch.device,
     torch_dtype: torch.dtype,
+    revision: str | None = None,
 ) -> PreTrainedModel:
     return AutoModelForCausalLM.from_pretrained(
         model_name,
+        revision=revision,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
     ).to(device).eval()
@@ -86,12 +93,29 @@ def _load_adapted_model(
     adapted_adapter_path: str | None,
     device: torch.device,
     torch_dtype: torch.dtype,
+    base_revision: str | None = None,
+    adapted_revision: str | None = None,
+    adapter_revision: str | None = None,
 ) -> PreTrainedModel:
     if adapted_adapter_path:
-        base_model = _load_model(base_model_name, device, torch_dtype=torch_dtype)
-        return PeftModel.from_pretrained(base_model, adapted_adapter_path).to(device).eval()
+        base_model = _load_model(
+            base_model_name,
+            device,
+            torch_dtype=torch_dtype,
+            revision=base_revision,
+        )
+        return PeftModel.from_pretrained(
+            base_model,
+            adapted_adapter_path,
+            revision=adapter_revision,
+        ).to(device).eval()
     if adapted_model_name:
-        return _load_model(adapted_model_name, device, torch_dtype=torch_dtype)
+        return _load_model(
+            adapted_model_name,
+            device,
+            torch_dtype=torch_dtype,
+            revision=adapted_revision,
+        )
     raise ValueError("Either adapted_model or adapted_adapter_path must be provided")
 
 
@@ -99,26 +123,11 @@ def _load_draft_model(
     draft_model_name: str,
     device: torch.device,
     torch_dtype: torch.dtype,
+    revision: str | None = None,
 ) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
-    tokenizer = _load_tokenizer(draft_model_name)
-    model = _load_model(draft_model_name, device, torch_dtype=torch_dtype)
+    tokenizer = _load_tokenizer(draft_model_name, revision=revision)
+    model = _load_model(draft_model_name, device, torch_dtype=torch_dtype, revision=revision)
     return model, tokenizer
-
-
-def _tokenizer_is_compatible(
-    reference_tokenizer: PreTrainedTokenizerBase,
-    candidate_tokenizer: PreTrainedTokenizerBase,
-    prompts: list[str],
-) -> bool:
-    if reference_tokenizer.vocab_size != candidate_tokenizer.vocab_size:
-        return False
-    for prompt in prompts[: min(4, len(prompts))]:
-        if reference_tokenizer(prompt, add_special_tokens=True)["input_ids"] != candidate_tokenizer(
-            prompt,
-            add_special_tokens=True,
-        )["input_ids"]:
-            return False
-    return True
 
 
 def _batch_prompts(prompts: list[str], batch_size: int) -> list[list[str]]:
@@ -293,6 +302,10 @@ def main() -> None:
     adapted_model_name = str(adapted_model_value) if adapted_model_value else None
     adapted_adapter_path = str(adapted_adapter_path_value) if adapted_adapter_path_value else None
     draft_model_value = get_config_value(config_data, args, "draft_model")
+    base_revision = get_config_value(config_data, args, "base_revision")
+    adapted_revision = get_config_value(config_data, args, "adapted_revision")
+    adapter_revision = get_config_value(config_data, args, "adapter_revision")
+    draft_revision = get_config_value(config_data, args, "draft_revision")
     prompts_file = str(prompts_file_value)
     eval_prompts_file_value = get_config_value(config_data, args, "eval_prompts_file")
     if not eval_prompts_file_value:
@@ -320,17 +333,42 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch_dtype = resolve_torch_dtype(torch_dtype_name, device=device)
 
+    base_artifact = resolve_artifact_revision(base_model_name, revision=base_revision)
+    adapted_artifact = (
+        resolve_artifact_revision(adapted_model_name, revision=adapted_revision)
+        if adapted_model_name
+        else None
+    )
+    adapter_artifact = (
+        resolve_artifact_revision(adapted_adapter_path, revision=adapter_revision)
+        if adapted_adapter_path
+        else None
+    )
+    draft_artifact = (
+        resolve_artifact_revision(str(draft_model_value), revision=draft_revision)
+        if draft_model_value
+        else None
+    )
+
     logger.info("Loading base and adapted models on %s", device)
-    tokenizer = _load_tokenizer(base_model_name)
+    tokenizer = _load_tokenizer(base_model_name, revision=base_artifact.revision_for_loading)
     adapted_model = _load_adapted_model(
         base_model_name=base_model_name,
         adapted_model_name=adapted_model_name,
         adapted_adapter_path=adapted_adapter_path,
         device=device,
         torch_dtype=torch_dtype,
+        base_revision=base_artifact.revision_for_loading,
+        adapted_revision=adapted_artifact.revision_for_loading if adapted_artifact else None,
+        adapter_revision=adapter_artifact.revision_for_loading if adapter_artifact else None,
     )
 
-    base_model = _load_model(base_model_name, device=device, torch_dtype=torch_dtype)
+    base_model = _load_model(
+        base_model_name,
+        device=device,
+        torch_dtype=torch_dtype,
+        revision=base_artifact.revision_for_loading,
+    )
     draft_model = None
     draft_tokenizer = None
     if not skip_speculative_proxy:
@@ -340,8 +378,9 @@ def main() -> None:
             str(draft_model_value),
             device=device,
             torch_dtype=torch_dtype,
+            revision=draft_artifact.revision_for_loading if draft_artifact else None,
         )
-        if not _tokenizer_is_compatible(tokenizer, draft_tokenizer, calibration_prompts + eval_prompts):
+        if not tokenizers_are_equivalent(tokenizer, draft_tokenizer, calibration_prompts + eval_prompts):
             raise ValueError("Draft tokenizer must be tokenization-compatible with the base/adapted tokenizer")
         correction_feature_model = draft_model
     else:
@@ -479,6 +518,12 @@ def main() -> None:
             "eval_prompts_file": eval_prompts_file,
             "prompts_provenance": prompts_provenance,
             "eval_prompts_provenance": eval_prompts_provenance,
+            "artifact_provenance": {
+                "base_model": base_artifact.to_dict(),
+                "adapted_model": adapted_artifact.to_dict() if adapted_artifact else None,
+                "adapter": adapter_artifact.to_dict() if adapter_artifact else None,
+                "draft_model": draft_artifact.to_dict() if draft_artifact else None,
+            },
             "low_rank_k": low_rank_k,
             "context_rank": context_rank,
             "context_hidden_dim": context_hidden_dim,

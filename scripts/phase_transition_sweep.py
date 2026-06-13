@@ -8,6 +8,7 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from lora_spec.artifacts import resolve_artifact_revision, tokenizers_are_equivalent
 from lora_spec.correction import LowRankCorrection
 from lora_spec.metrics import simulate_speculative_decoding
 from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
@@ -34,8 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep adapter magnitude to detect analytical-correction phase transitions.")
     add_common_args(parser)
     parser.add_argument("--base-model", type=str, default=None)
+    parser.add_argument("--base-revision", type=str, default=None)
     parser.add_argument("--draft-model", type=str, default=None)
+    parser.add_argument("--draft-revision", type=str, default=None)
     parser.add_argument("--adapter-path", type=str, default=None)
+    parser.add_argument("--adapter-revision", type=str, default=None)
     parser.add_argument(
         "--prompts-file",
         type=str,
@@ -63,16 +67,22 @@ def _parse_values(raw: str) -> list[float]:
     return values
 
 
-def _load_model(model_name: str, device: torch.device, torch_dtype: torch.dtype):
+def _load_model(
+    model_name: str,
+    device: torch.device,
+    torch_dtype: torch.dtype,
+    revision: str | None = None,
+) -> Any:
     return AutoModelForCausalLM.from_pretrained(
         model_name,
+        revision=revision,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
     ).to(device).eval()
 
 
-def _load_tokenizer(model_name: str):
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+def _load_tokenizer(model_name: str, revision: str | None = None) -> Any:
+    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision, use_fast=True)
     tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -92,9 +102,20 @@ def _load_scaled_adapted_model(
     scale: float,
     device: torch.device,
     torch_dtype: torch.dtype,
-):
-    base_model = _load_model(base_model_name, device, torch_dtype=torch_dtype)
-    adapted = PeftModel.from_pretrained(base_model, adapter_path).to(device).eval()
+    base_revision: str | None = None,
+    adapter_revision: str | None = None,
+) -> Any:
+    base_model = _load_model(
+        base_model_name,
+        device,
+        torch_dtype=torch_dtype,
+        revision=base_revision,
+    )
+    adapted = PeftModel.from_pretrained(
+        base_model,
+        adapter_path,
+        revision=adapter_revision,
+    ).to(device).eval()
     _apply_lora_scale(adapted, scale)
     return adapted
 
@@ -107,18 +128,6 @@ def _prepare_prompt_input_ids(tokenizer: Any, prompts: list[str]) -> list[torch.
         if length >= 1:
             sequences.append(encoded["input_ids"][index, :length].clone())
     return sequences
-
-
-def _tokenizer_is_compatible(reference_tokenizer: Any, candidate_tokenizer: Any, prompts: list[str]) -> bool:
-    if reference_tokenizer.vocab_size != candidate_tokenizer.vocab_size:
-        return False
-    for prompt in prompts[: min(4, len(prompts))]:
-        if reference_tokenizer(prompt, add_special_tokens=True)["input_ids"] != candidate_tokenizer(
-            prompt,
-            add_special_tokens=True,
-        )["input_ids"]:
-            return False
-    return True
 
 
 def _heldout_normalized_logit_error(
@@ -170,6 +179,9 @@ def main() -> None:
     draft_model_name = str(draft_model_value)
     adapter_path = str(adapter_path_value)
     prompts_file = str(prompts_file_value)
+    base_revision = get_config_value(config_data, args, "base_revision")
+    draft_revision = get_config_value(config_data, args, "draft_revision")
+    adapter_revision = get_config_value(config_data, args, "adapter_revision")
     eval_prompts_file_value = get_config_value(config_data, args, "eval_prompts_file")
     if not eval_prompts_file_value:
         raise ValueError("eval_prompts_file must be provided separately from prompts_file")
@@ -191,12 +203,25 @@ def main() -> None:
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch_dtype = resolve_torch_dtype(torch_dtype_name, device=device)
-    tokenizer = _load_tokenizer(base_model_name)
-    draft_tokenizer = _load_tokenizer(draft_model_name)
-    if not _tokenizer_is_compatible(tokenizer, draft_tokenizer, calibration_prompts + eval_prompts):
+    base_artifact = resolve_artifact_revision(base_model_name, revision=base_revision)
+    draft_artifact = resolve_artifact_revision(draft_model_name, revision=draft_revision)
+    adapter_artifact = resolve_artifact_revision(adapter_path, revision=adapter_revision)
+    tokenizer = _load_tokenizer(base_model_name, revision=base_artifact.revision_for_loading)
+    draft_tokenizer = _load_tokenizer(draft_model_name, revision=draft_artifact.revision_for_loading)
+    if not tokenizers_are_equivalent(tokenizer, draft_tokenizer, calibration_prompts + eval_prompts):
         raise ValueError("draft_model tokenizer must be compatible with base_model tokenizer")
-    base_model = _load_model(base_model_name, device, torch_dtype=torch_dtype)
-    draft_model = _load_model(draft_model_name, device, torch_dtype=torch_dtype)
+    base_model = _load_model(
+        base_model_name,
+        device,
+        torch_dtype=torch_dtype,
+        revision=base_artifact.revision_for_loading,
+    )
+    draft_model = _load_model(
+        draft_model_name,
+        device,
+        torch_dtype=torch_dtype,
+        revision=draft_artifact.revision_for_loading,
+    )
     prompt_input_ids = [sequence.to(device) for sequence in _prepare_prompt_input_ids(draft_tokenizer, eval_prompts)]
 
     rows: list[dict[str, Any]] = []
@@ -208,6 +233,8 @@ def main() -> None:
             scale,
             device,
             torch_dtype=torch_dtype,
+            base_revision=base_artifact.revision_for_loading,
+            adapter_revision=adapter_artifact.revision_for_loading,
         )
         shift_matrix = compute_logit_shift_matrix(
             base_model=base_model,
@@ -311,6 +338,11 @@ def main() -> None:
             "eval_prompts_file": eval_prompts_file,
             "prompts_provenance": prompts_provenance,
             "eval_prompts_provenance": eval_prompts_provenance,
+            "artifact_provenance": {
+                "base_model": base_artifact.to_dict(),
+                "draft_model": draft_artifact.to_dict(),
+                "adapter": adapter_artifact.to_dict(),
+            },
             "magnitude_values": magnitude_values,
             "correction_rank": correction_rank,
             "batch_size": batch_size,
