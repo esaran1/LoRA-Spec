@@ -42,7 +42,9 @@ class RecoveryComparisonResult:
         guaranteed_delta = np.asarray(self.guaranteed_recovery_delta)[order]
         axes[0].scatter(errors, empirical_delta, color="#1d4ed8", label="empirical")
         axes[0].plot(errors, guaranteed_delta, color="#d55c4b", label="guaranteed lower bound")
-        axes[0].set_xlabel("Total variation" if self.error_metric == "total_variation" else "Residual logit span")
+        axes[0].set_xlabel(
+            "Total variation" if self.error_metric == "total_variation" else "Residual logit span"
+        )
         axes[0].set_ylabel("Acceptance recovery delta")
         axes[0].set_title("Recovery Guarantee")
         axes[0].legend(loc="best")
@@ -100,14 +102,15 @@ def acceptance_lower_bound_from_logit_residual(
 ) -> torch.Tensor:
     """Lower-bound acceptance using the shift-invariant span of the logit residual.
 
-    If the residual span is s, the likelihood ratio is bounded within a factor
-    exp(s), which gives TV <= tanh(s / 2) and acceptance >= 1 - tanh(s / 2).
+    If the residual-logit oscillation is s, the normalized likelihood-ratio
+    oscillation is also s. The tight ratio-oscillation bound is
+    TV <= tanh(s / 4), hence acceptance >= 1 - tanh(s / 4).
     """
     if target_logits.shape != approximate_logits.shape:
         raise ValueError("target_logits and approximate_logits must have matching shapes")
     residual = target_logits.float() - approximate_logits.float()
     span = residual.amax(dim=dim) - residual.amin(dim=dim)
-    return 1.0 - torch.tanh(0.5 * span)
+    return 1.0 - torch.tanh(0.25 * span)
 
 
 def predicted_acceptance_recovery(
@@ -118,7 +121,7 @@ def predicted_acceptance_recovery(
     """Return a per-token acceptance lower bound under standard rejection sampling.
 
     For total variation the expression is the exact expected acceptance identity.
-    For residual logit span s it uses TV <= tanh(s / 2).
+    For residual logit span s it uses the tight TV <= tanh(s / 4) bound.
     """
     errors = _as_array(approximation_error)
     if not 0.0 <= base_acceptance <= 1.0:
@@ -128,7 +131,7 @@ def predicted_acceptance_recovery(
             raise ValueError("total variation must lie in [0, 1]")
         lower_bound = 1.0 - np.clip(errors, 0.0, 1.0)
     elif error_metric == "logit_span":
-        lower_bound = 1.0 - np.tanh(0.5 * errors)
+        lower_bound = 1.0 - np.tanh(0.25 * errors)
     else:
         raise ValueError(f"Unsupported error_metric: {error_metric}")
     guaranteed_delta = lower_bound - float(base_acceptance)

@@ -78,25 +78,32 @@ class MultivariateRegressionModel(_EvaluationMixin):
     def __init__(self, ridge: float = 1e-6) -> None:
         self.ridge = ridge
         self.coefficients: np.ndarray | None = None
+        self.feature_mean: np.ndarray | None = None
+        self.feature_std: np.ndarray | None = None
 
     def fit(self, features: ArrayLike, targets: ArrayLike) -> "MultivariateRegressionModel":
         x = np.asarray(features, dtype=np.float64)
         y = np.asarray(targets, dtype=np.float64).reshape(-1, 1)
         if x.ndim == 1:
             x = x.reshape(-1, 1)
-        design = np.concatenate([np.ones((x.shape[0], 1)), x], axis=1)
+        self.feature_mean = x.mean(axis=0, keepdims=True)
+        self.feature_std = x.std(axis=0, keepdims=True)
+        self.feature_std[self.feature_std < 1e-12] = 1.0
+        normalized = (x - self.feature_mean) / self.feature_std
+        design = np.concatenate([np.ones((x.shape[0], 1)), normalized], axis=1)
         ridge_eye = np.eye(design.shape[1]) * self.ridge
         ridge_eye[0, 0] = 0.0
         self.coefficients = np.linalg.solve(design.T @ design + ridge_eye, design.T @ y)
         return self
 
     def predict(self, features: ArrayLike) -> np.ndarray:
-        if self.coefficients is None:
+        if self.coefficients is None or self.feature_mean is None or self.feature_std is None:
             raise RuntimeError("Model must be fit before predict")
         x = np.asarray(features, dtype=np.float64)
         if x.ndim == 1:
             x = x.reshape(-1, 1)
-        design = np.concatenate([np.ones((x.shape[0], 1)), x], axis=1)
+        normalized = (x - self.feature_mean) / self.feature_std
+        design = np.concatenate([np.ones((x.shape[0], 1)), normalized], axis=1)
         return (design @ self.coefficients).reshape(-1)
 
 
@@ -178,6 +185,39 @@ def leave_one_out_cv(
         train_mask[index] = False
         model = model_factory().fit(x[train_mask], y[train_mask])
         predictions[index] = model.predict(x[[index]])[0]
+    mse = float(np.mean((predictions - y) ** 2))
+    return RegressionMetrics(
+        r_squared=r_squared_score(y, predictions),
+        mse=mse,
+        predictions=predictions.tolist(),
+        targets=y.tolist(),
+    )
+
+
+def leave_one_group_out_cv(
+    model_factory: Callable[[], Regressor],
+    features: ArrayLike,
+    targets: ArrayLike,
+    groups: list[str] | np.ndarray,
+) -> RegressionMetrics:
+    x = np.asarray(features, dtype=np.float64)
+    y = np.asarray(targets, dtype=np.float64).reshape(-1)
+    group_values = np.asarray(groups, dtype=str).reshape(-1)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    if len(y) != len(group_values):
+        raise ValueError("groups must contain exactly one value per target")
+    unique_groups = np.unique(group_values)
+    if unique_groups.size < 2:
+        raise ValueError("Grouped cross-validation requires at least two groups")
+    predictions = np.zeros_like(y)
+    for group in unique_groups:
+        test_mask = group_values == group
+        train_mask = ~test_mask
+        if not np.any(train_mask) or not np.any(test_mask):
+            raise ValueError(f"Invalid grouped fold for {group}")
+        model = model_factory().fit(x[train_mask], y[train_mask])
+        predictions[test_mask] = model.predict(x[test_mask])
     mse = float(np.mean((predictions - y) ** 2))
     return RegressionMetrics(
         r_squared=r_squared_score(y, predictions),

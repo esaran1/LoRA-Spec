@@ -20,8 +20,10 @@ class AdapterConfig(BaseModel):
     epochs: int | None = Field(default=None, ge=1)
     hf_path: str
     revision: str | None = None
-    magnitude_scale: float = Field(1.0, gt=0.0)
+    magnitude_scale: float = Field(1.0, ge=0.0)
     target_model: str | None = None
+    replicate_id: str | None = None
+    training_seed: int | None = None
 
 
 class ExperimentConfig(BaseModel):
@@ -45,9 +47,9 @@ class ResultRecord(BaseModel):
 
     config_hash: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    acceptance_rate_overall: float
+    acceptance_rate_overall: float = Field(..., ge=0.0, le=1.0)
     acceptance_rate_per_position: list[float]
-    throughput_tps: float
+    throughput_tps: float = Field(..., ge=0.0)
     ttft_ms: float
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -59,4 +61,6 @@ class ResultRecord(BaseModel):
     ) -> list[float]:
         if not values:
             raise ValueError("acceptance_rate_per_position must not be empty")
+        if any(not 0.0 <= value <= 1.0 for value in values):
+            raise ValueError("acceptance_rate_per_position values must lie in [0, 1]")
         return values

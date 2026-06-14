@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from enum import Enum
 
 import pytest
 import torch
@@ -14,7 +15,12 @@ from safetensors.torch import save_file
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutput
 
-from lora_spec.adapter_props import compute_adapter_properties, compute_distribution_divergence, load_lora_matrices
+from lora_spec.adapter_props import (
+    compute_adapter_properties,
+    compute_distribution_divergence,
+    load_lora_matrices,
+    validate_plain_lora_config,
+)
 
 
 class TinyConfig(PretrainedConfig):
@@ -88,7 +94,9 @@ class TinyLM(PreTrainedModel):
             self.embedding.weight.copy_(torch.eye(self.config.vocab_size))
             self.lm_head.weight.copy_(torch.eye(self.config.vocab_size))
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, **kwargs):
+    def forward(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None, **kwargs
+    ):
         hidden = self.embedding(input_ids)
         logits = self.lm_head(hidden) + self.delta.view(1, 1, -1)
         return CausalLMOutput(logits=logits)
@@ -143,3 +151,24 @@ def test_compute_distribution_divergence_reports_true_per_prompt_values() -> Non
     assert divergence.num_positions == 6
     assert divergence.kl_divergence > 0.0
     assert divergence.js_divergence > 0.0
+
+
+@pytest.mark.parametrize(
+    "config, marker",
+    [
+        ({"peft_type": "LORA", "use_dora": True}, "use_dora"),
+        ({"peft_type": "LORA", "bias": "all"}, "bias=all"),
+        ({"peft_type": "LORA", "modules_to_save": ["lm_head"]}, "modules_to_save"),
+        ({"peft_type": "LOHA"}, "peft_type=LOHA"),
+    ],
+)
+def test_plain_lora_validation_fails_closed(config: dict[str, object], marker: str) -> None:
+    with pytest.raises(ValueError, match=marker):
+        validate_plain_lora_config(config)
+
+
+def test_plain_lora_validation_accepts_peft_enum_string_form() -> None:
+    class PeftType(Enum):
+        LORA = "LORA"
+
+    validate_plain_lora_config({"peft_type": PeftType.LORA})

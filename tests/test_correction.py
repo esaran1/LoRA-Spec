@@ -23,8 +23,34 @@ class TinyTokenizer:
         self.vocab_size = vocab_size
         self.pad_token = "<pad>"
         self.eos_token = "<eos>"
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+        self.bos_token_id = None
+        self.unk_token_id = None
+        self.mask_token_id = None
+        self.sep_token_id = None
+        self.cls_token_id = None
 
-    def __call__(self, texts: list[str], return_tensors: str, padding: bool, truncation: bool):
+    def __len__(self) -> int:
+        return self.vocab_size
+
+    def get_vocab(self) -> dict[str, int]:
+        return {str(index): index for index in range(self.vocab_size)}
+
+    def get_added_vocab(self) -> dict[str, int]:
+        return {}
+
+    def __call__(
+        self,
+        texts: list[str] | str,
+        return_tensors: str | None = None,
+        padding: bool = False,
+        truncation: bool = False,
+        add_special_tokens: bool = True,
+    ):
+        _ = return_tensors, padding, truncation, add_special_tokens
+        if isinstance(texts, str):
+            return {"input_ids": [int(piece) % self.vocab_size for piece in texts.split()]}
         tokenized = []
         for text in texts:
             values = [int(piece) % self.vocab_size for piece in text.split()]
@@ -43,7 +69,9 @@ class TinyTokenizer:
 
 
 class TinyOutput:
-    def __init__(self, logits: torch.Tensor, hidden_states: tuple[torch.Tensor, ...] | None = None) -> None:
+    def __init__(
+        self, logits: torch.Tensor, hidden_states: tuple[torch.Tensor, ...] | None = None
+    ) -> None:
         self.logits = logits
         self.hidden_states = hidden_states
 
@@ -92,7 +120,9 @@ def test_mean_shift_correction_recovers_constant_shift() -> None:
     )
     base = TinyLM()
     adapted = TinyLM(shift_matrix=delta)
-    correction = MeanShiftCorrection().calibrate(base, adapted, ["0 1 2", "1 2 3"], tokenizer=tokenizer)
+    correction = MeanShiftCorrection().calibrate(
+        base, adapted, ["0 1 2", "1 2 3"], tokenizer=tokenizer
+    )
     adjusted = correction.apply(torch.zeros(1, tokenizer.vocab_size)).squeeze(0)
     assert adjusted.shape[0] == tokenizer.vocab_size
     assert torch.allclose(adjusted, delta.mean(dim=0), atol=1e-5)
@@ -105,7 +135,9 @@ def test_low_rank_correction_recovers_structured_shift() -> None:
     shift_matrix = left @ right
     base = TinyLM()
     adapted = TinyLM(shift_matrix=shift_matrix)
-    correction = LowRankCorrection(rank=1).calibrate(base, adapted, ["0 1 2 3", "1 2 3 0"], tokenizer=tokenizer)
+    correction = LowRankCorrection(rank=1).calibrate(
+        base, adapted, ["0 1 2 3", "1 2 3 0"], tokenizer=tokenizer
+    )
     logits = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     adjusted = correction.apply(logits)
     expected = logits + shift_matrix[0].view(1, -1)
@@ -121,6 +153,7 @@ def test_low_rank_correction_recovers_structured_shift() -> None:
         abs=1e-5,
     )
     assert report.operator_calibration_relative_frobenius < 0.2
+    assert report.end_to_end_calibration_relative_frobenius < 0.2
 
 
 def test_context_dependent_correction_uses_hidden_state() -> None:
@@ -135,7 +168,9 @@ def test_context_dependent_correction_uses_hidden_state() -> None:
     )
     base = TinyLM()
     adapted = TinyLM(shift_matrix=shift_matrix)
-    correction = ContextDependentCorrection(rank=2, hidden_dim=8, epochs=100, lr=1e-2, seed=0).calibrate(
+    correction = ContextDependentCorrection(
+        rank=2, hidden_dim=8, epochs=100, lr=1e-2, seed=0
+    ).calibrate(
         base,
         adapted,
         ["0 1 2 3", "2 3 0 1"],

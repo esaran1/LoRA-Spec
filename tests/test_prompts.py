@@ -11,6 +11,7 @@ from lora_spec.prompts import (
     load_frozen_prompt_texts,
     load_prompt_records,
     prompt_file_provenance,
+    select_frozen_prompts,
     verify_prompt_manifest,
     verify_prompt_release_lock,
 )
@@ -138,6 +139,25 @@ def test_provenance_rejects_unregistered_file(tmp_path: Path) -> None:
         )
 
 
+def test_select_frozen_prompts_is_deterministic_and_records_ids(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, evaluation_texts=["one", "two", "three"])
+    first, first_provenance = select_frozen_prompts(
+        tmp_path / "evaluation.jsonl",
+        expected_split="evaluation",
+        num_prompts=2,
+        seed=11,
+    )
+    second, second_provenance = select_frozen_prompts(
+        tmp_path / "evaluation.jsonl",
+        expected_split="evaluation",
+        num_prompts=2,
+        seed=11,
+    )
+    assert first == second
+    assert first_provenance["selected_prompt_ids"] == second_provenance["selected_prompt_ids"]
+    assert first_provenance["selection_seed"] == 11
+
+
 def test_release_lock_rejects_manifest_edit(tmp_path: Path) -> None:
     manifest_path = _write_manifest(tmp_path)
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -161,8 +181,7 @@ def test_manifest_rejects_near_duplicate_cross_split_prompts(tmp_path: Path) -> 
 def test_prompt_records_reject_blank_lines_and_duplicate_keys(tmp_path: Path) -> None:
     blank_path = tmp_path / "blank.jsonl"
     blank_path.write_text(
-        '{"id":"x","split":"calibration","domain":"x","task":"x",'
-        '"source":"x","text":"valid"}\n\n',
+        '{"id":"x","split":"calibration","domain":"x","task":"x","source":"x","text":"valid"}\n\n',
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="Blank JSONL line"):

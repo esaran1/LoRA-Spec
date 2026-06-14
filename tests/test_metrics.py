@@ -8,6 +8,9 @@ import torch
 
 from lora_spec.metrics import (
     AcceptanceAccumulator,
+    SpeculativeDecodingMetrics,
+    TimingMetrics,
+    aggregate_speculative_metrics,
     collect_speculative_metrics,
     patch_vllm_rejection_sampler,
     simulate_speculative_decoding,
@@ -46,6 +49,12 @@ def test_acceptance_accumulator_accounts_for_bonus_token() -> None:
     assert summary.overall_acceptance_rate == 1.0
     assert summary.per_position_acceptance_rate == [1.0, 1.0, 1.0]
     assert summary.acceptance_by_depth == [1.0, 1.0, 1.0]
+
+
+def test_acceptance_accumulator_rejects_depth_beyond_configured_speculation() -> None:
+    accumulator = AcceptanceAccumulator(speculation_length=2)
+    with pytest.raises(ValueError, match="exceeding configured"):
+        accumulator.record([True, True, False])
 
 
 def test_bonus_token_does_not_inflate_draft_acceptance() -> None:
@@ -163,6 +172,177 @@ def test_patch_vllm_rejection_sampler_observes_bonus_tokens_from_forward(
     summary = accumulator.summarize()
     assert summary.accepted_drafted_tokens == 2
     assert summary.bonus_tokens == 1
+
+
+def test_patch_vllm_v1_sampler_recovers_exact_accepted_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejection_module = types.ModuleType("vllm.v1.sample.rejection_sampler")
+
+    class Metadata:
+        num_draft_tokens = [3, 2]
+
+    class RejectionSampler:
+        def forward(self, metadata: Metadata) -> torch.Tensor:
+            _ = metadata
+            return torch.tensor(
+                [
+                    [11, 12, 13, 14],  # Three accepted drafts plus bonus.
+                    [21, -1, -1, -1],  # Immediate rejection plus recovery.
+                ],
+                dtype=torch.int32,
+            )
+
+        @staticmethod
+        def parse_output(
+            output_token_ids: torch.Tensor,
+            vocab_size: int,
+            discard_req_indices: tuple[int, ...] = (),
+            logprobs_tensors: object | None = None,
+        ) -> tuple[list[list[int]], None]:
+            _ = logprobs_tensors
+            discarded = set(discard_req_indices)
+            outputs = []
+            for index, row in enumerate(output_token_ids.tolist()):
+                outputs.append(
+                    []
+                    if index in discarded
+                    else [token for token in row if token != -1 and token < vocab_size]
+                )
+            return outputs, None
+
+    rejection_module.RejectionSampler = RejectionSampler
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.v1", types.ModuleType("vllm.v1"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.sample", types.ModuleType("vllm.v1.sample"))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.sample.rejection_sampler",
+        rejection_module,
+    )
+
+    with patch_vllm_rejection_sampler(speculation_length=3) as (accumulator, backend):
+        output = RejectionSampler().forward(Metadata())
+        RejectionSampler.parse_output(output, vocab_size=100)
+    summary = accumulator.summarize()
+    assert backend.endswith("RejectionSampler.parse_output.accepted_prefix")
+    assert summary.total_drafted_tokens == 5
+    assert summary.accepted_drafted_tokens == 3
+    assert summary.bonus_tokens == 1
+    assert summary.per_position_attempts == [2, 1, 1]
+
+
+def test_patch_vllm_v1_uses_parsed_tokens_and_skips_discarded_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejection_module = types.ModuleType("vllm.v1.sample.rejection_sampler")
+
+    class Metadata:
+        num_draft_tokens = [2, 2, 2]
+
+    class RejectionSampler:
+        def forward(self, metadata: Metadata) -> torch.Tensor:
+            _ = metadata
+            return torch.tensor(
+                [
+                    [1, 2, 3],
+                    [4, 100, -1],
+                    [5, 6, 7],
+                ],
+                dtype=torch.int32,
+            )
+
+        @staticmethod
+        def parse_output(
+            output_token_ids: torch.Tensor,
+            vocab_size: int,
+            discard_req_indices: tuple[int, ...] = (),
+            logprobs_tensors: object | None = None,
+        ) -> tuple[list[list[int]], None]:
+            _ = logprobs_tensors
+            discarded = set(discard_req_indices)
+            outputs = []
+            for index, row in enumerate(output_token_ids.tolist()):
+                outputs.append(
+                    []
+                    if index in discarded
+                    else [token for token in row if token != -1 and token < vocab_size]
+                )
+            return outputs, None
+
+    rejection_module.RejectionSampler = RejectionSampler
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.v1", types.ModuleType("vllm.v1"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.sample", types.ModuleType("vllm.v1.sample"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.sample.rejection_sampler", rejection_module)
+
+    with patch_vllm_rejection_sampler(speculation_length=2) as (accumulator, _):
+        output = RejectionSampler().forward(Metadata())
+        RejectionSampler.parse_output(output, vocab_size=100, discard_req_indices=(2,))
+
+    summary = accumulator.summarize()
+    assert summary.total_drafted_tokens == 4
+    assert summary.accepted_drafted_tokens == 2
+    assert summary.bonus_tokens == 1
+    assert summary.per_position_attempts == [2, 1]
+
+
+def test_patch_vllm_v1_fails_if_sampler_output_is_not_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejection_module = types.ModuleType("vllm.v1.sample.rejection_sampler")
+
+    class Metadata:
+        num_draft_tokens = [1]
+
+    class RejectionSampler:
+        def forward(self, metadata: Metadata) -> torch.Tensor:
+            _ = metadata
+            return torch.tensor([[1, 2]], dtype=torch.int32)
+
+        @staticmethod
+        def parse_output(
+            output_token_ids: torch.Tensor,
+            vocab_size: int,
+            discard_req_indices: tuple[int, ...] = (),
+            logprobs_tensors: object | None = None,
+        ) -> tuple[list[list[int]], None]:
+            _ = discard_req_indices, logprobs_tensors
+            return [
+                [token for token in row if token != -1 and token < vocab_size]
+                for row in output_token_ids.tolist()
+            ], None
+
+    rejection_module.RejectionSampler = RejectionSampler
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.v1", types.ModuleType("vllm.v1"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.sample", types.ModuleType("vllm.v1.sample"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.sample.rejection_sampler", rejection_module)
+
+    with pytest.raises(RuntimeError, match="were not parsed in-process"):
+        with patch_vllm_rejection_sampler(speculation_length=1):
+            RejectionSampler().forward(Metadata())
+
+
+def test_aggregate_speculative_metrics_weights_each_depth_by_eligible_steps() -> None:
+    long = AcceptanceAccumulator()
+    long.record([True, True, True])
+    short = AcceptanceAccumulator()
+    short.record([True])
+    short.record([False])
+
+    def measured(accumulator: AcceptanceAccumulator) -> SpeculativeDecodingMetrics:
+        return SpeculativeDecodingMetrics(
+            acceptance=accumulator.summarize(),
+            timing=TimingMetrics(1.0, 1.0, 1, 1.0),
+            instrumentation_backend="test",
+        )
+
+    aggregate = aggregate_speculative_metrics([measured(long), measured(short)])
+
+    assert aggregate.acceptance.depth_attempts == [3, 1, 1]
+    assert aggregate.acceptance.depth_accepted == [2, 1, 1]
+    assert aggregate.acceptance.acceptance_by_depth == pytest.approx([2 / 3, 1.0, 1.0])
 
 
 def test_simulate_speculative_decoding_tracks_acceptance_and_bonus_tokens() -> None:

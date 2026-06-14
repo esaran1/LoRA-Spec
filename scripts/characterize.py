@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import argparse
-import json
 import random
 from pathlib import Path
 from typing import Any
 
 from lora_spec.artifacts import materialize_artifact, resolve_artifact_revision
 from lora_spec.config import AdapterConfig, ExperimentConfig, ModelPairConfig
-from lora_spec.prompts import prompt_file_provenance, resolve_registered_prompt_split
+from lora_spec.design import audit_experiment_design
+from lora_spec.prompts import file_sha256, prompt_file_provenance, resolve_registered_prompt_split
 from lora_spec.utils import (
     add_common_args,
     canonical_json,
     compute_config_hash,
     ensure_dir,
     get_config_value,
+    get_git_dirty,
+    get_git_hash,
     load_yaml,
     resolve_config,
     set_seed,
@@ -43,10 +45,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs-dir", type=str, default="results/characterize/runs")
     parser.add_argument("--output-dir", type=str, default="results/characterize")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--require-paper-ready-design", action="store_true")
     return parser.parse_args()
 
 
-def _load_sweep_inputs(models_path: str, adapters_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_sweep_inputs(
+    models_path: str, adapters_path: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
     models_payload = load_yaml(models_path)
     adapters_payload = load_yaml(adapters_path)
     model_pairs = models_payload.get("model_pairs", {})
@@ -68,9 +73,13 @@ def _matches_filters(
         return False
     if filters.get("selected_adapter") and adapter_name != filters["selected_adapter"]:
         return False
-    if filters.get("selected_rank") is not None and int(adapter_values["rank"]) != int(filters["selected_rank"]):
+    if filters.get("selected_rank") is not None and int(adapter_values["rank"]) != int(
+        filters["selected_rank"]
+    ):
         return False
-    if filters.get("selected_domain") and str(adapter_values["domain"]) != str(filters["selected_domain"]):
+    if filters.get("selected_domain") and str(adapter_values["domain"]) != str(
+        filters["selected_domain"]
+    ):
         return False
     if filters.get("selected_epochs") is not None:
         if adapter_values.get("epochs") is None:
@@ -146,13 +155,14 @@ def _run_config_fingerprint(
 
 
 def _load_existing_run(path: Path) -> dict[str, Any]:
+    import json
+
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.verbose, "characterize")
-    set_seed(args.seed)
     config_data = resolve_config(args.config, args.override)
     seed = int(get_config_value(config_data, args, "seed"))
     set_seed(seed)
@@ -171,6 +181,17 @@ def main() -> None:
     runs_dir = ensure_dir(str(get_config_value(config_data, args, "runs_dir")))
     output_dir = str(get_config_value(config_data, args, "output_dir"))
     resume = bool(get_config_value(config_data, args, "resume", args.resume))
+    require_paper_ready = bool(
+        get_config_value(
+            config_data,
+            args,
+            "require_paper_ready_design",
+            args.require_paper_ready_design,
+        )
+    )
+    git_hash = get_git_hash(Path.cwd())
+    if resume and get_git_dirty(Path.cwd()):
+        raise ValueError("--resume requires a clean Git worktree so code provenance is unambiguous")
 
     filters = {
         "selected_model": config_data.get("selected_model"),
@@ -181,6 +202,15 @@ def main() -> None:
     }
 
     model_pairs, adapters_payload = _load_sweep_inputs(models_config, adapters_config)
+    design_report = audit_experiment_design(
+        adapters_payload,
+        {"model_pairs": model_pairs},
+    )
+    if require_paper_ready and not design_report.paper_ready:
+        raise ValueError(
+            "Adapter configuration is not paper-ready; run "
+            "scripts/validate_experiment_design.py for the missing cells and confounds"
+        )
     manifest = _build_manifest_entries(model_pairs, adapters_payload, filters)
     if not manifest:
         raise ValueError("No characterization runs matched the requested manifest and filters")
@@ -259,7 +289,7 @@ def main() -> None:
             model_pair_name,
             adapter_name,
             prompt_metadata,
-            artifact_provenance,
+            {**artifact_provenance, "code_git_hash": git_hash},
         )
         run_path = runs_dir / f"{model_pair_name}__{adapter_name}__{run_fingerprint}.json"
 
@@ -287,7 +317,22 @@ def main() -> None:
                 "prompt_metadata": prompt_metadata,
                 "artifact_provenance": artifact_provenance,
             }
-            run_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            write_json_result(
+                payload=payload,
+                output_dir=runs_dir,
+                stem="characterize_run",
+                config={
+                    "experiment": result["experiment"],
+                    "model_pair_name": model_pair_name,
+                    "adapter_name": adapter_name,
+                    "prompt_metadata": prompt_metadata,
+                    "artifact_provenance": artifact_provenance,
+                    "code_git_hash": git_hash,
+                },
+                cwd=Path.cwd(),
+                exact_path=run_path,
+            )
+            payload = _load_existing_run(run_path)
             logger.info("Wrote run artifact to %s", run_path)
 
         run_records.append(payload)
@@ -295,6 +340,7 @@ def main() -> None:
     aggregate = {
         "runs": run_records,
         "manifest": manifest,
+        "design_report": design_report.to_dict(),
         "summary": {
             "num_runs": len(run_records),
             "dataset": dataset,
@@ -311,6 +357,8 @@ def main() -> None:
         config={
             "models_config": models_config,
             "adapters_config": adapters_config,
+            "models_config_sha256": file_sha256(models_config),
+            "adapters_config_sha256": file_sha256(adapters_config),
             "dataset": dataset,
             "prompts_file": prompts_file,
             "prompt_metadata": prompt_metadata,
@@ -321,7 +369,12 @@ def main() -> None:
             "gpu_memory_utilization": gpu_memory_utilization,
             "resume": resume,
             "filters": filters,
+            "require_paper_ready_design": require_paper_ready,
+            "design_report": design_report.to_dict(),
             "manifest_hash": compute_config_hash(canonical_json(manifest)),
+            "run_config_hashes": [record.get("config_hash") for record in run_records],
+            "code_git_hash": git_hash,
+            "seed": seed,
         },
         cwd=Path.cwd(),
     )

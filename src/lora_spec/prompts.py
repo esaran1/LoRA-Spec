@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import unicodedata
 from collections import Counter
@@ -156,8 +157,7 @@ def _word_ngrams(text: str, ngram_size: int) -> set[tuple[str, ...]]:
     if len(tokens) < ngram_size:
         return {tuple(tokens)} if tokens else set()
     return {
-        tuple(tokens[index : index + ngram_size])
-        for index in range(len(tokens) - ngram_size + 1)
+        tuple(tokens[index : index + ngram_size]) for index in range(len(tokens) - ngram_size + 1)
     }
 
 
@@ -167,8 +167,12 @@ def _maximum_cross_split_jaccard(
     ngram_size: int,
 ) -> float:
     maximum = 0.0
-    calibration_ngrams = [(_word_ngrams(record.text, ngram_size), record.id) for record in calibration]
-    evaluation_ngrams = [(_word_ngrams(record.text, ngram_size), record.id) for record in evaluation]
+    calibration_ngrams = [
+        (_word_ngrams(record.text, ngram_size), record.id) for record in calibration
+    ]
+    evaluation_ngrams = [
+        (_word_ngrams(record.text, ngram_size), record.id) for record in evaluation
+    ]
     for calibration_set, _ in calibration_ngrams:
         for evaluation_set, _ in evaluation_ngrams:
             union = calibration_set | evaluation_set
@@ -182,14 +186,18 @@ def load_prompt_records(path: str | Path) -> list[FrozenPromptRecord]:
     if prompt_path.suffix.lower() != ".jsonl":
         raise ValueError(f"Frozen prompt files must use JSONL: {prompt_path}")
     records: list[FrozenPromptRecord] = []
-    for line_number, line in enumerate(prompt_path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, line in enumerate(
+        prompt_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         if not line.strip():
             raise ValueError(f"Blank JSONL line in {prompt_path}:{line_number}")
         payload = _load_json(line, f"{prompt_path}:{line_number}")
         try:
             records.append(FrozenPromptRecord.model_validate(payload))
         except ValueError as exc:
-            raise ValueError(f"Invalid prompt record in {prompt_path}:{line_number}: {exc}") from exc
+            raise ValueError(
+                f"Invalid prompt record in {prompt_path}:{line_number}: {exc}"
+            ) from exc
     if not records:
         raise ValueError(f"No prompt records found in {prompt_path}")
     ids = [record.id for record in records]
@@ -220,7 +228,9 @@ def _validate_prompt_release_lock(
     lock_path: str | Path | None = None,
 ) -> tuple[Path, str, str]:
     resolved_manifest = Path(manifest_path).resolve()
-    resolved_lock = Path(lock_path).resolve() if lock_path else resolved_manifest.parent / "release.lock.json"
+    resolved_lock = (
+        Path(lock_path).resolve() if lock_path else resolved_manifest.parent / "release.lock.json"
+    )
     if not resolved_lock.exists():
         raise FileNotFoundError(f"Frozen prompt release lock not found: {resolved_lock}")
     release_lock = load_prompt_release_lock(resolved_lock)
@@ -339,7 +349,9 @@ def resolve_registered_prompt_split(
     manifest_path: str | Path | None = None,
 ) -> RegisteredPromptSplit:
     prompt_path = Path(path).resolve()
-    resolved_manifest = Path(manifest_path).resolve() if manifest_path else prompt_path.parent / "manifest.json"
+    resolved_manifest = (
+        Path(manifest_path).resolve() if manifest_path else prompt_path.parent / "manifest.json"
+    )
     if not resolved_manifest.exists():
         raise FileNotFoundError(f"Frozen prompt manifest not found: {resolved_manifest}")
     verification = verify_prompt_manifest(resolved_manifest)
@@ -413,6 +425,42 @@ def prompt_file_provenance(
         "manifest_path": str(display_manifest_path),
         "manifest_name": verification.manifest_name,
         "manifest_sha256": verification.manifest_sha256,
-        "release_lock_path": str(display_manifest_path.parent / verification.release_lock_path.name),
+        "release_lock_path": str(
+            display_manifest_path.parent / verification.release_lock_path.name
+        ),
         "release_lock_sha256": verification.release_lock_sha256,
     }
+
+
+def select_frozen_prompts(
+    path: str | Path,
+    expected_split: PromptSplitName,
+    num_prompts: int,
+    seed: int,
+    manifest_path: str | Path | None = None,
+) -> tuple[list[str], dict[str, object]]:
+    if num_prompts < 1:
+        raise ValueError("num_prompts must be positive")
+    registered = resolve_registered_prompt_split(
+        path,
+        expected_split=expected_split,
+        manifest_path=manifest_path,
+    )
+    if num_prompts > len(registered.records):
+        raise ValueError(
+            f"Requested {num_prompts} prompts, but frozen {expected_split} split has "
+            f"{len(registered.records)}",
+        )
+    indices = list(range(len(registered.records)))
+    random.Random(seed).shuffle(indices)
+    selected = [registered.records[index] for index in indices[:num_prompts]]
+    provenance = {
+        **prompt_file_provenance(
+            path,
+            expected_split=expected_split,
+            manifest_path=manifest_path,
+        ),
+        "selected_prompt_ids": [record.id for record in selected],
+        "selection_seed": seed,
+    }
+    return [record.text for record in selected], provenance

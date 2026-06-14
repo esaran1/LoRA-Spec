@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import importlib.metadata
 import json
@@ -9,7 +10,9 @@ import math
 import os
 import platform
 import random
+import statistics
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -55,10 +58,7 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
     if hasattr(value, "__dataclass_fields__"):
-        return {
-            field: _to_jsonable(getattr(value, field))
-            for field in value.__dataclass_fields__
-        }
+        return {field: _to_jsonable(getattr(value, field)) for field in value.__dataclass_fields__}
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
@@ -85,6 +85,34 @@ def canonical_json(data: Any) -> str:
 def compute_config_hash(config: Any) -> str:
     payload = canonical_json(config).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def mean_ci95(values: list[float]) -> tuple[float, float, float]:
+    if not values:
+        raise ValueError("Cannot summarize an empty measurement list")
+    mean = statistics.mean(values)
+    if len(values) == 1:
+        return float(mean), float(mean), float(mean)
+    critical_values = {
+        1: 12.706,
+        2: 4.303,
+        3: 3.182,
+        4: 2.776,
+        5: 2.571,
+        6: 2.447,
+        7: 2.365,
+        8: 2.306,
+        9: 2.262,
+        10: 2.228,
+        15: 2.131,
+        20: 2.086,
+        30: 2.042,
+    }
+    degrees_of_freedom = len(values) - 1
+    eligible = [key for key in critical_values if key <= degrees_of_freedom]
+    critical_value = critical_values[max(eligible)] if eligible else critical_values[1]
+    half_width = critical_value * statistics.stdev(values) / math.sqrt(len(values))
+    return float(mean), float(mean - half_width), float(mean + half_width)
 
 
 def get_git_hash(cwd: str | Path | None = None) -> str:
@@ -117,6 +145,85 @@ def get_git_dirty(cwd: str | Path | None = None) -> bool | None:
     return bool(result.stdout.strip())
 
 
+def capture_git_source_snapshot(
+    cwd: str | Path | None = None,
+    max_file_bytes: int = 5 * 1024 * 1024,
+    max_total_bytes: int = 25 * 1024 * 1024,
+) -> dict[str, Any] | None:
+    """Capture an exact dirty-tree snapshot for reconstructing experiment source."""
+    if cwd is None:
+        return None
+    if not get_git_dirty(cwd):
+        return None
+    try:
+        tracked_patch = subprocess.check_output(
+            ["git", "diff", "--binary", "HEAD"],
+            cwd=cwd,
+        )
+        untracked_output = subprocess.check_output(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=cwd,
+        )
+        root = Path(
+            subprocess.check_output(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=cwd,
+                text=True,
+            ).strip()
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    if len(tracked_patch) > max_total_bytes:
+        raise ValueError(
+            "Dirty tracked-source patch exceeds the provenance size limit; "
+            "commit the source before running experiments",
+        )
+    untracked: dict[str, str] = {}
+    total_bytes = len(tracked_patch)
+    for raw_path in untracked_output.split(b"\0"):
+        if not raw_path:
+            continue
+        relative = raw_path.decode("utf-8", errors="surrogateescape")
+        relative_path = Path(relative)
+        lowered_parts = {part.lower() for part in relative_path.parts}
+        lowered_name = relative_path.name.lower()
+        is_environment_secret = lowered_name.startswith(".env") and lowered_name not in {
+            ".env.example",
+            ".env.template",
+            ".env.sample",
+        }
+        if (
+            is_environment_secret
+            or ".env" in lowered_parts
+            or any(
+                marker in relative_path.name.lower()
+                for marker in ("credential", "secret", "private_key", "access_token")
+            )
+        ):
+            raise ValueError(
+                f"Refusing to embed potentially sensitive untracked file {relative}; "
+                "ignore it or commit only a sanitized example",
+            )
+        content = (root / relative).read_bytes()
+        if len(content) > max_file_bytes:
+            raise ValueError(
+                f"Untracked file {relative} exceeds the provenance size limit; "
+                "ignore it or commit it through an appropriate artifact store",
+            )
+        total_bytes += len(content)
+        if total_bytes > max_total_bytes:
+            raise ValueError(
+                "Dirty source snapshot exceeds the provenance size limit; "
+                "commit the source before running experiments",
+            )
+        untracked[relative] = base64.b64encode(content).decode("ascii")
+    return {
+        "format": "git-diff-binary-plus-base64-untracked-v1",
+        "tracked_patch_base64": base64.b64encode(tracked_patch).decode("ascii"),
+        "untracked_files_base64": untracked,
+    }
+
+
 def get_runtime_metadata() -> dict[str, Any]:
     package_versions: dict[str, str] = {}
     for package_name in ("transformers", "peft", "vllm", "datasets", "safetensors"):
@@ -135,11 +242,33 @@ def get_runtime_metadata() -> dict[str, Any]:
         device_count = torch.cuda.device_count()
         metadata["gpu_count"] = device_count
         metadata["gpu_names"] = [torch.cuda.get_device_name(index) for index in range(device_count)]
+        metadata["gpu_capabilities"] = [
+            list(torch.cuda.get_device_capability(index)) for index in range(device_count)
+        ]
         metadata["cuda_version"] = torch.version.cuda
+        metadata["cudnn_version"] = torch.backends.cudnn.version()
+        try:
+            driver = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=driver_version",
+                    "--format=csv,noheader",
+                ],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            metadata["gpu_driver_versions"] = sorted(
+                {line.strip() for line in driver.splitlines() if line.strip()}
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            metadata["gpu_driver_versions"] = []
     else:
         metadata["gpu_count"] = 0
         metadata["gpu_names"] = []
+        metadata["gpu_capabilities"] = []
         metadata["cuda_version"] = None
+        metadata["cudnn_version"] = None
+        metadata["gpu_driver_versions"] = []
     return metadata
 
 
@@ -149,7 +278,11 @@ def resolve_torch_dtype(
 ) -> torch.dtype:
     normalized = (value or "auto").lower()
     if normalized == "auto":
-        target_device = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        target_device = (
+            torch.device(device)
+            if device is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
         if target_device.type == "cuda":
             if torch.cuda.is_bf16_supported():
                 return torch.bfloat16
@@ -175,9 +308,10 @@ def write_json_result(
     config: Mapping[str, Any] | BaseModel | None = None,
     extra_metadata: Mapping[str, Any] | None = None,
     cwd: str | Path | None = None,
+    exact_path: str | Path | None = None,
 ) -> Path:
     directory = ensure_dir(output_dir)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     config_hash = compute_config_hash(config if config is not None else payload)
     data = _to_jsonable(payload)
     if not isinstance(data, dict):
@@ -192,8 +326,45 @@ def write_json_result(
         data["full_config"] = _to_jsonable(config)
     data["config_hash"] = config_hash
     data["metadata"] = metadata
-    path = directory / f"{stem}_{timestamp}_{config_hash}.json"
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    path = (
+        Path(exact_path)
+        if exact_path is not None
+        else directory / f"{stem}_{timestamp}_{config_hash}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    source_snapshot = capture_git_source_snapshot(cwd=cwd)
+
+    def atomic_write_text(target: Path, content: str) -> None:
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+
+    if source_snapshot is not None:
+        source_serialized = json.dumps(source_snapshot, indent=2, sort_keys=True)
+        source_path = path.with_suffix(".source.json")
+        atomic_write_text(source_path, source_serialized)
+        metadata["source_snapshot_path"] = source_path.name
+        metadata["source_snapshot_sha256"] = hashlib.sha256(
+            source_serialized.encode("utf-8")
+        ).hexdigest()
+        data["metadata"] = metadata
+    serialized = json.dumps(data, indent=2, sort_keys=True)
+    atomic_write_text(path, serialized)
     return path
 
 

@@ -27,22 +27,25 @@ nvidia-smi
 PATTERNS=("uniform" "skewed_80_20" "bursty")
 PATTERN="${PATTERNS[$SLURM_ARRAY_TASK_ID]}"
 
+: "${VLLM_SERVER_URL:?Set VLLM_SERVER_URL to a concurrently serving vLLM endpoint}"
+: "${SERVER_PROVENANCE_JSON:?Set SERVER_PROVENANCE_JSON to the server-side provenance manifest}"
+
 CMD=(
   python scripts/benchmark_serving.py
   --target-model meta-llama/Meta-Llama-3-8B-Instruct
   --draft-model meta-llama/Llama-3.2-1B-Instruct
   --adapter-path AdnanRiaz107/CodeLLAMA3-8BI-APPS
-  --dataset tatsu-lab/alpaca
-  --num-prompts 128
+  --adapter-model-name code-lora
+  --server-url "${VLLM_SERVER_URL}"
+  --server-provenance-json "${SERVER_PROVENANCE_JSON}"
+  --prompts-file data/prompts/pilot_v1/evaluation.jsonl
+  --num-prompts 32
+  --measurement-repetitions 3
   --traffic-pattern "${PATTERN}"
   --concurrency 4
   --requests-per-tenant 8
   --speculation-length 4
   --verbose
 )
-
-if [[ -n "${VLLM_SERVER_URL:-}" ]]; then
-  CMD+=(--server-url "${VLLM_SERVER_URL}")
-fi
 
 "${CMD[@]}"

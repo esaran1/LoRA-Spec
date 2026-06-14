@@ -35,6 +35,21 @@ def test_logit_span_bound_is_shift_invariant_and_valid() -> None:
     assert torch.allclose(lower_bound, shifted_bound, atol=1e-7)
 
 
+def test_logit_span_bound_is_tight_for_symmetric_binary_logits() -> None:
+    target_logits = torch.tensor([[1.0, -1.0]])
+    approximate_logits = torch.tensor([[-1.0, 1.0]])
+    acceptance = rejection_sampling_acceptance(
+        torch.softmax(target_logits, dim=-1),
+        torch.softmax(approximate_logits, dim=-1),
+    )
+    bound = acceptance_lower_bound_from_logit_residual(
+        target_logits,
+        approximate_logits,
+    )
+
+    assert torch.allclose(bound, acceptance, atol=1e-6)
+
+
 def test_total_variation_prediction_is_exact_acceptance_identity() -> None:
     prediction = predicted_acceptance_recovery(
         approximation_error=[0.0, 0.25, 0.5, 1.0],

@@ -7,14 +7,24 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
 
 from lora_spec.artifacts import resolve_artifact_revision, tokenizers_are_equivalent
 from lora_spec.correction import ContextDependentCorrection, LowRankCorrection, MeanShiftCorrection
 from lora_spec.metrics import simulate_speculative_decoding
 from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
 from lora_spec.theory import (
+    ContinuationContextSet,
+    LogitShiftDataset,
+    build_continuation_contexts,
     center_logit_shift_rows,
+    collect_context_model_outputs,
+    collect_logit_shift_dataset,
     first_order_logit_shift,
     nonlinearity_residual,
     parameter_delta_from_models,
@@ -59,7 +69,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--speculation-length", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--continuation-tokens", type=int, default=16)
     parser.add_argument("--torch-dtype", type=str, default="auto")
+    parser.add_argument("--jvp-max-tangent-mb", type=int, default=512)
+    parser.add_argument("--skip-first-order", action="store_true")
     parser.add_argument("--skip-speculative-proxy", action="store_true")
     parser.add_argument("--output-dir", type=str, default="results/correction")
     return parser.parse_args()
@@ -79,12 +92,16 @@ def _load_model(
     torch_dtype: torch.dtype,
     revision: str | None = None,
 ) -> PreTrainedModel:
-    return AutoModelForCausalLM.from_pretrained(
-        model_name,
-        revision=revision,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-    ).to(device).eval()
+    return (
+        AutoModelForCausalLM.from_pretrained(
+            model_name,
+            revision=revision,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        )
+        .to(device)
+        .eval()
+    )
 
 
 def _load_adapted_model(
@@ -104,11 +121,15 @@ def _load_adapted_model(
             torch_dtype=torch_dtype,
             revision=base_revision,
         )
-        return PeftModel.from_pretrained(
-            base_model,
-            adapted_adapter_path,
-            revision=adapter_revision,
-        ).to(device).eval()
+        return (
+            PeftModel.from_pretrained(
+                base_model,
+                adapted_adapter_path,
+                revision=adapter_revision,
+            )
+            .to(device)
+            .eval()
+        )
     if adapted_model_name:
         return _load_model(
             adapted_model_name,
@@ -130,10 +151,6 @@ def _load_draft_model(
     return model, tokenizer
 
 
-def _batch_prompts(prompts: list[str], batch_size: int) -> list[list[str]]:
-    return [prompts[index : index + batch_size] for index in range(0, len(prompts), batch_size)]
-
-
 def _evaluate_against_adapted(
     correction: Any | None,
     draft_model: PreTrainedModel,
@@ -141,70 +158,56 @@ def _evaluate_against_adapted(
     tokenizer: PreTrainedTokenizerBase,
     prompts: list[str],
     batch_size: int,
+    continuation_contexts: ContinuationContextSet,
 ) -> dict[str, float]:
-    device = next(draft_model.parameters()).device
-    total_positions = 0
-    kl_sum = 0.0
-    js_sum = 0.0
-    baseline_residual_sum = 0.0
-    corrected_residual_sum = 0.0
-
-    for batch_prompts in _batch_prompts(prompts, batch_size):
-        encoded = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True)
-        encoded = {name: tensor.to(device) for name, tensor in encoded.items()}
-        requires_hidden = bool(getattr(correction, "requires_hidden_state", False)) if correction is not None else False
-        with torch.no_grad():
-            draft_outputs = draft_model(**encoded, output_hidden_states=requires_hidden)
-            adapted_logits = adapted_model(**encoded).logits[:, :-1, :].float()
-        draft_logits = draft_outputs.logits[:, :-1, :].float()
-        hidden_state = None
-        if requires_hidden:
-            hidden_states = getattr(draft_outputs, "hidden_states", None)
-            if not hidden_states:
-                raise ValueError("Draft model did not return hidden states required by the correction")
-            hidden_state = hidden_states[-1][:, :-1, :].float()
-
-        adjusted_logits = draft_logits if correction is None else correction.apply(draft_logits, hidden_state=hidden_state)
-        adjusted_log_probs = F.log_softmax(adjusted_logits, dim=-1)
-        adapted_log_probs = F.log_softmax(adapted_logits, dim=-1)
-        adjusted_probs = adjusted_log_probs.exp()
-        adapted_probs = adapted_log_probs.exp()
-
-        mask = encoded["attention_mask"][:, 1:].bool()
-        positions = int(mask.sum().item())
-        if positions == 0:
-            continue
-
-        kl = torch.sum(adapted_probs * (adapted_log_probs - adjusted_log_probs), dim=-1)
-        midpoint = 0.5 * (adapted_probs + adjusted_probs)
-        midpoint_log = torch.log(midpoint.clamp_min(1e-12))
-        js_left = torch.sum(adapted_probs * (adapted_log_probs - midpoint_log), dim=-1)
-        js_right = torch.sum(adjusted_probs * (adjusted_log_probs - midpoint_log), dim=-1)
-        js = 0.5 * (js_left + js_right)
-        expanded_mask = mask.unsqueeze(-1).expand_as(adapted_logits)
-        baseline_delta = center_logit_shift_rows(
-            (draft_logits - adapted_logits).reshape(-1, adapted_logits.shape[-1]),
-        ).reshape_as(adapted_logits)
-        corrected_delta = center_logit_shift_rows(
-            (adjusted_logits - adapted_logits).reshape(-1, adapted_logits.shape[-1]),
-        ).reshape_as(adapted_logits)
-        baseline_residual = baseline_delta.masked_select(expanded_mask)
-        corrected_residual = corrected_delta.masked_select(expanded_mask)
-
-        total_positions += positions
-        kl_sum += float(kl.masked_select(mask).sum().item())
-        js_sum += float(js.masked_select(mask).sum().item())
-        baseline_residual_sum += float(torch.sum(baseline_residual.square()).item())
-        corrected_residual_sum += float(torch.sum(corrected_residual.square()).item())
-
-    if total_positions == 0:
-        raise ValueError("Prompt set did not yield any valid next-token positions")
+    _ = prompts
+    requires_hidden = (
+        bool(getattr(correction, "requires_hidden_state", False))
+        if correction is not None
+        else False
+    )
+    draft_logits, hidden_state, _, _ = collect_context_model_outputs(
+        draft_model,
+        tokenizer,
+        continuation_contexts,
+        batch_size=batch_size,
+        collect_hidden_states=requires_hidden,
+    )
+    adapted_logits, _, _, _ = collect_context_model_outputs(
+        adapted_model,
+        tokenizer,
+        continuation_contexts,
+        batch_size=batch_size,
+    )
+    adjusted_logits = (
+        draft_logits
+        if correction is None
+        else correction.apply(
+            draft_logits,
+            hidden_state=hidden_state,
+        )
+    )
+    adjusted_log_probs = F.log_softmax(adjusted_logits, dim=-1)
+    adapted_log_probs = F.log_softmax(adapted_logits, dim=-1)
+    adjusted_probs = adjusted_log_probs.exp()
+    adapted_probs = adapted_log_probs.exp()
+    kl = torch.sum(adapted_probs * (adapted_log_probs - adjusted_log_probs), dim=-1)
+    midpoint = 0.5 * (adapted_probs + adjusted_probs)
+    midpoint_log = torch.log(midpoint.clamp_min(1e-12))
+    js = 0.5 * (
+        torch.sum(adapted_probs * (adapted_log_probs - midpoint_log), dim=-1)
+        + torch.sum(adjusted_probs * (adjusted_log_probs - midpoint_log), dim=-1)
+    )
+    baseline_residual = center_logit_shift_rows(draft_logits - adapted_logits)
+    corrected_residual = center_logit_shift_rows(adjusted_logits - adapted_logits)
+    total_positions = int(draft_logits.shape[0])
     return {
-        "kl_divergence": kl_sum / total_positions,
-        "js_divergence": js_sum / total_positions,
+        "kl_divergence": float(kl.mean().item()),
+        "js_divergence": float(js.mean().item()),
         "num_positions": float(total_positions),
         "heldout_normalized_logit_error": float(
-            (corrected_residual_sum ** 0.5) / max(baseline_residual_sum ** 0.5, 1e-12),
+            torch.linalg.matrix_norm(corrected_residual, ord="fro").item()
+            / max(torch.linalg.matrix_norm(baseline_residual, ord="fro").item(), 1e-12),
         ),
     }
 
@@ -234,6 +237,8 @@ def _proxy_metrics_to_dict(metrics: Any) -> dict[str, Any]:
         "per_position_attempts": metrics.acceptance.per_position_attempts,
         "per_position_accepted": metrics.acceptance.per_position_accepted,
         "acceptance_by_depth": metrics.acceptance.acceptance_by_depth,
+        "depth_attempts": metrics.acceptance.depth_attempts,
+        "depth_accepted": metrics.acceptance.depth_accepted,
         "accepted_drafted_tokens": metrics.acceptance.accepted_drafted_tokens,
         "total_drafted_tokens": metrics.acceptance.total_drafted_tokens,
         "bonus_tokens": metrics.acceptance.bonus_tokens,
@@ -248,11 +253,10 @@ def _proxy_metrics_to_dict(metrics: Any) -> dict[str, Any]:
 
 
 def _correction_bundle(
-    base_model: PreTrainedModel,
-    adapted_model: PreTrainedModel,
-    feature_model: PreTrainedModel,
-    prompts: list[str],
-    tokenizer: PreTrainedTokenizerBase,
+    calibration_dataset: LogitShiftDataset,
+    feature_logits: torch.Tensor,
+    feature_hidden_states: torch.Tensor,
+    training_device: torch.device,
     low_rank_k: int,
     context_rank: int,
     context_hidden_dim: int,
@@ -260,20 +264,21 @@ def _correction_bundle(
     context_lr: float,
     seed: int,
 ) -> dict[str, Any]:
-    mean_shift = MeanShiftCorrection().calibrate(base_model, adapted_model, prompts, tokenizer=tokenizer)
-    low_rank = LowRankCorrection(rank=low_rank_k).calibrate(base_model, adapted_model, prompts, tokenizer=tokenizer)
+    mean_shift = MeanShiftCorrection().calibrate_from_dataset(calibration_dataset)
+    low_rank = LowRankCorrection(rank=low_rank_k).calibrate_from_dataset(
+        calibration_dataset,
+        feature_logits,
+    )
     context = ContextDependentCorrection(
         rank=context_rank,
         hidden_dim=context_hidden_dim,
         epochs=context_epochs,
         lr=context_lr,
         seed=seed,
-    ).calibrate(
-        base_model,
-        adapted_model,
-        prompts,
-        tokenizer=tokenizer,
-        feature_model=feature_model,
+    ).calibrate_from_dataset(
+        calibration_dataset,
+        feature_hidden_states,
+        training_device=training_device,
     )
     return {
         "baseline": None,
@@ -286,8 +291,9 @@ def _correction_bundle(
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.verbose, "analytical_correction")
-    set_seed(args.seed)
     config_data = resolve_config(args.config, args.override)
+    seed = int(get_config_value(config_data, args, "seed"))
+    set_seed(seed)
 
     base_model_value = get_config_value(config_data, args, "base_model")
     prompts_file_value = get_config_value(config_data, args, "prompts_file")
@@ -319,8 +325,15 @@ def main() -> None:
     batch_size = int(get_config_value(config_data, args, "batch_size"))
     speculation_length = int(get_config_value(config_data, args, "speculation_length"))
     max_new_tokens = int(get_config_value(config_data, args, "max_new_tokens"))
+    continuation_tokens = int(get_config_value(config_data, args, "continuation_tokens"))
     torch_dtype_name = str(get_config_value(config_data, args, "torch_dtype"))
-    skip_speculative_proxy = bool(get_config_value(config_data, args, "skip_speculative_proxy", args.skip_speculative_proxy))
+    jvp_max_tangent_mb = int(get_config_value(config_data, args, "jvp_max_tangent_mb"))
+    skip_first_order = bool(
+        get_config_value(config_data, args, "skip_first_order", args.skip_first_order)
+    )
+    skip_speculative_proxy = bool(
+        get_config_value(config_data, args, "skip_speculative_proxy", args.skip_speculative_proxy)
+    )
     output_dir = str(get_config_value(config_data, args, "output_dir"))
 
     calibration_prompts = load_frozen_prompt_texts(prompts_file, expected_split="calibration")
@@ -369,56 +382,33 @@ def main() -> None:
         torch_dtype=torch_dtype,
         revision=base_artifact.revision_for_loading,
     )
-    draft_model = None
-    draft_tokenizer = None
-    if not skip_speculative_proxy:
-        if not draft_model_value:
-            raise ValueError("draft_model must be provided unless --skip-speculative-proxy is set")
-        draft_model, draft_tokenizer = _load_draft_model(
-            str(draft_model_value),
-            device=device,
-            torch_dtype=torch_dtype,
-            revision=draft_artifact.revision_for_loading if draft_artifact else None,
-        )
-        if not tokenizers_are_equivalent(tokenizer, draft_tokenizer, calibration_prompts + eval_prompts):
-            raise ValueError("Draft tokenizer must be tokenization-compatible with the base/adapted tokenizer")
-        correction_feature_model = draft_model
-    else:
-        correction_feature_model = base_model
-
-    logger.info("Calibrating corrections on %d prompts", len(calibration_prompts))
-    corrections = _correction_bundle(
-        base_model=base_model,
-        adapted_model=adapted_model,
-        feature_model=correction_feature_model,
-        prompts=calibration_prompts,
-        tokenizer=tokenizer,
-        low_rank_k=low_rank_k,
-        context_rank=context_rank,
-        context_hidden_dim=context_hidden_dim,
-        context_epochs=context_epochs,
-        context_lr=context_lr,
-        seed=args.seed,
+    calibration_contexts = build_continuation_contexts(
+        base_model,
+        tokenizer,
+        calibration_prompts,
+        max_new_tokens=continuation_tokens,
+    )
+    evaluation_contexts = build_continuation_contexts(
+        base_model,
+        tokenizer,
+        eval_prompts,
+        max_new_tokens=continuation_tokens,
     )
 
-    logger.info("Evaluating corrected draft logits against adapted target on %d prompts", len(eval_prompts))
-    divergence_results = {
-        name: _evaluate_against_adapted(
-            correction=correction,
-            draft_model=draft_model if draft_model is not None else base_model,
-            adapted_model=adapted_model,
-            tokenizer=tokenizer,
-            prompts=eval_prompts,
-            batch_size=batch_size,
-        )
-        for name, correction in corrections.items()
-    }
+    calibration_dataset = collect_logit_shift_dataset(
+        base_model=base_model,
+        adapted_model=adapted_model,
+        calibration_prompts=calibration_prompts,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        continuation_contexts=calibration_contexts,
+    )
 
     logger.info("Computing first-order residual diagnostics")
     true_shift_matrix = None
     first_order_matrix = None
     residual_report = None
-    try:
+    if not skip_first_order:
         from lora_spec.theory import compute_logit_shift_matrix
 
         delta_W = parameter_delta_from_models(base_model, adapted_model)
@@ -428,6 +418,7 @@ def main() -> None:
             calibration_prompts=eval_prompts,
             tokenizer=tokenizer,
             batch_size=batch_size,
+            continuation_contexts=evaluation_contexts,
         )
         first_order_matrix = first_order_logit_shift(
             base_model=base_model,
@@ -435,15 +426,90 @@ def main() -> None:
             calibration_prompts=eval_prompts,
             tokenizer=tokenizer,
             batch_size=1,
+            max_tangent_bytes=jvp_max_tangent_mb * 1024 * 1024,
+            continuation_contexts=evaluation_contexts,
         )
         residual_report = nonlinearity_residual(true_shift_matrix, first_order_matrix)
-    except Exception as exc:  # pragma: no cover - diagnostic fallback
-        logger.warning("First-order residual diagnostic failed: %s", exc)
+
+    draft_model = None
+    if skip_speculative_proxy:
+        draft_tokenizer = tokenizer
+        feature_logits, feature_hidden_states, _, _ = collect_context_model_outputs(
+            base_model,
+            tokenizer,
+            calibration_contexts,
+            batch_size=batch_size,
+            collect_hidden_states=True,
+        )
+        evaluation_model = base_model
+    else:
+        if not draft_model_value:
+            raise ValueError("draft_model must be provided unless --skip-speculative-proxy is set")
+        del base_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        draft_model, draft_tokenizer = _load_draft_model(
+            str(draft_model_value),
+            device=device,
+            torch_dtype=torch_dtype,
+            revision=draft_artifact.revision_for_loading if draft_artifact else None,
+        )
+        if not tokenizers_are_equivalent(
+            tokenizer, draft_tokenizer, calibration_prompts + eval_prompts
+        ):
+            raise ValueError(
+                "Draft tokenizer must be tokenization-compatible with the base/adapted tokenizer"
+            )
+        feature_logits, feature_hidden_states, _, _ = collect_context_model_outputs(
+            draft_model,
+            draft_tokenizer,
+            calibration_contexts,
+            batch_size=batch_size,
+            collect_hidden_states=True,
+        )
+        evaluation_model = draft_model
+    if feature_hidden_states is None:
+        raise RuntimeError("Correction feature model did not return hidden states")
+
+    logger.info("Calibrating corrections on %d prompts", len(calibration_prompts))
+    corrections = _correction_bundle(
+        calibration_dataset=calibration_dataset,
+        feature_logits=feature_logits,
+        feature_hidden_states=feature_hidden_states,
+        training_device=device,
+        low_rank_k=low_rank_k,
+        context_rank=context_rank,
+        context_hidden_dim=context_hidden_dim,
+        context_epochs=context_epochs,
+        context_lr=context_lr,
+        seed=seed,
+    )
+
+    logger.info(
+        "Evaluating corrected draft logits against adapted target on %d prompts", len(eval_prompts)
+    )
+    divergence_results = {
+        name: _evaluate_against_adapted(
+            correction=correction,
+            draft_model=evaluation_model,
+            adapted_model=adapted_model,
+            tokenizer=tokenizer,
+            prompts=eval_prompts,
+            batch_size=batch_size,
+            continuation_contexts=evaluation_contexts,
+        )
+        for name, correction in corrections.items()
+    }
 
     proxy_payload: dict[str, Any] = {}
     if draft_model is not None and draft_tokenizer is not None:
-        logger.info("Simulating speculative decoding recovery proxy on %d prompts", len(eval_prompts))
-        prompt_input_ids = [sequence.to(device) for sequence in _prepare_prompt_input_ids(draft_tokenizer, eval_prompts)]
+        logger.info(
+            "Simulating speculative decoding recovery proxy on %d prompts", len(eval_prompts)
+        )
+        prompt_input_ids = [
+            sequence.to(device)
+            for sequence in _prepare_prompt_input_ids(draft_tokenizer, eval_prompts)
+        ]
         for name, correction in corrections.items():
             proxy_metrics = simulate_speculative_decoding(
                 draft_model=draft_model,
@@ -476,6 +542,14 @@ def main() -> None:
                 low_rank_report.centered_operator_relative_frobenius
             ),
             "operator_calibration_relative_frobenius": low_rank_report.operator_calibration_relative_frobenius,
+            "end_to_end_calibration_relative_frobenius": low_rank_report.end_to_end_calibration_relative_frobenius,
+            "base_feature_coefficient_relative_frobenius": (
+                low_rank_report.base_feature_coefficient_relative_frobenius
+            ),
+            "base_feature_operator_relative_frobenius": (
+                low_rank_report.base_feature_operator_relative_frobenius
+            ),
+            "application_feature_source": "draft" if draft_model is not None else "base_target",
             "retained_energy_fraction": low_rank_report.retained_energy_fraction,
             "selected_rank": low_rank_report.selected_rank,
             "apply_overhead_ms": corrections["low_rank"].measure_overhead_ms(device=device),
@@ -532,8 +606,15 @@ def main() -> None:
             "batch_size": batch_size,
             "speculation_length": speculation_length,
             "max_new_tokens": max_new_tokens,
+            "continuation_tokens": continuation_tokens,
+            "trajectory_policy": evaluation_contexts.generation_policy,
+            "calibration_contexts_sha256": calibration_contexts.sha256(),
+            "evaluation_contexts_sha256": evaluation_contexts.sha256(),
             "torch_dtype": torch_dtype_name,
+            "jvp_max_tangent_mb": jvp_max_tangent_mb,
+            "skip_first_order": skip_first_order,
             "skip_speculative_proxy": skip_speculative_proxy,
+            "seed": seed,
         },
         cwd=Path.cwd(),
     )

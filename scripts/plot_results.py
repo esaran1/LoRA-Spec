@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -9,11 +10,20 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 
-from lora_spec.utils import add_common_args, ensure_dir, get_config_value, resolve_config, setup_logging, write_json_result
+from lora_spec.utils import (
+    add_common_args,
+    ensure_dir,
+    get_config_value,
+    resolve_config,
+    setup_logging,
+    write_json_result,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate LoRA-Spec figures from result JSON artifacts.")
+    parser = argparse.ArgumentParser(
+        description="Generate LoRA-Spec figures from result JSON artifacts."
+    )
     add_common_args(parser)
     parser.add_argument("--input-json", action="append", default=[])
     parser.add_argument("--input-dir", type=str, default="results")
@@ -109,7 +119,8 @@ def _extract_characterize_rows(payloads: list[dict[str, Any]]) -> list[dict[str,
             adapted = result.get("adapted", {})
             comparison = result.get("comparison", {})
             experiment = run.get("experiment", {})
-            adapter = experiment.get("adapter", {})
+            experiment_config = experiment.get("experiment", experiment)
+            adapter = experiment_config.get("adapter", {})
             rows.append(
                 {
                     "model_pair_name": run.get("model_pair_name"),
@@ -132,7 +143,7 @@ def _plot_characterize(payloads: list[dict[str, Any]], output_dir: Path) -> list
         return []
     paths: list[Path] = []
     figure, axes = plt.subplots(1, 2, figsize=(13, 4.5))
-    grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         epoch_label = "unknown" if row["epochs"] is None else str(row["epochs"])
         grouped[(str(row["model_pair_name"]), str(row["domain"]), epoch_label)].append(row)
@@ -197,9 +208,9 @@ def _plot_predictive(payloads: list[dict[str, Any]], output_dir: Path) -> list[P
         return []
     latest = _latest_payload(payloads)
     models = [
-        ("linear_loocv", "Linear LOOCV", "#4f46e5"),
-        ("multivariate_loocv", "Multivariate LOOCV", "#0f766e"),
-        ("mlp_loocv", "MLP LOOCV", "#b45309"),
+        ("linear_grouped_cv", "Linear source-held-out", "#4f46e5"),
+        ("multivariate_grouped_cv", "Multivariate source-held-out", "#0f766e"),
+        ("mlp_grouped_cv", "MLP source-held-out", "#b45309"),
     ]
     figure, axes = plt.subplots(1, len(models), figsize=(15, 4.5))
     paths: list[Path] = []
@@ -220,7 +231,7 @@ def _plot_predictive(payloads: list[dict[str, Any]], output_dir: Path) -> list[P
         axis.set_title(f"{title}\n$R^2$={metrics.get('r_squared', float('nan')):.3f}")
         axis.set_xlabel("observed")
         axis.set_ylabel("predicted")
-    paths.append(_save_figure(figure, output_dir / "predictive_loocv_scatter.png"))
+    paths.append(_save_figure(figure, output_dir / "predictive_grouped_cv_scatter.png"))
     return paths
 
 
@@ -298,14 +309,38 @@ def _plot_serving(payloads: list[dict[str, Any]], output_dir: Path) -> list[Path
     x = np.arange(len(labels))
     width = 0.35
     figure, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-    axes[0].bar(x - width / 2, [row["baseline_tps"] for row in rows], width=width, label="baseline", color="#5b7c99")
-    axes[0].bar(x + width / 2, [row["adapted_tps"] for row in rows], width=width, label="adapted", color="#d55c4b")
+    axes[0].bar(
+        x - width / 2,
+        [row["baseline_tps"] for row in rows],
+        width=width,
+        label="baseline",
+        color="#5b7c99",
+    )
+    axes[0].bar(
+        x + width / 2,
+        [row["adapted_tps"] for row in rows],
+        width=width,
+        label="adapted",
+        color="#d55c4b",
+    )
     axes[0].set_title("Serving Throughput by Traffic Pattern")
     axes[0].set_xticks(x, labels)
     axes[0].set_ylabel("tokens/sec")
     axes[0].legend(loc="best")
-    axes[1].bar(x - width / 2, [row["baseline_p95"] for row in rows], width=width, label="baseline", color="#5b7c99")
-    axes[1].bar(x + width / 2, [row["adapted_p95"] for row in rows], width=width, label="adapted", color="#d55c4b")
+    axes[1].bar(
+        x - width / 2,
+        [row["baseline_p95"] for row in rows],
+        width=width,
+        label="baseline",
+        color="#5b7c99",
+    )
+    axes[1].bar(
+        x + width / 2,
+        [row["adapted_p95"] for row in rows],
+        width=width,
+        label="adapted",
+        color="#d55c4b",
+    )
     axes[1].set_title("Serving p95 Latency by Traffic Pattern")
     axes[1].set_xticks(x, labels)
     axes[1].set_ylabel("ms")
@@ -326,7 +361,9 @@ def _plot_measure_logit_shift_rank(payloads: list[dict[str, Any]], output_dir: P
         grouped[str(row["model_pair_name"])].append(row)
     palette = plt.cm.Set2(np.linspace(0, 1, max(len(grouped), 1)))
     for color, (model_pair, group_rows) in zip(palette, sorted(grouped.items())):
-        ordered = sorted(group_rows, key=lambda item: (float(item["magnitude_scale"]), int(item["adapter_rank"])))
+        ordered = sorted(
+            group_rows, key=lambda item: (float(item["magnitude_scale"]), int(item["adapter_rank"]))
+        )
         axes[0].scatter(
             [int(row["adapter_rank"]) for row in ordered],
             [int(row["effective_rank"]) for row in ordered],
@@ -349,7 +386,9 @@ def _plot_measure_logit_shift_rank(payloads: list[dict[str, Any]], output_dir: P
     return [_save_figure(figure, output_dir / "theory_effective_rank.png")]
 
 
-def _plot_validate_correction_theory(payloads: list[dict[str, Any]], output_dir: Path) -> list[Path]:
+def _plot_validate_correction_theory(
+    payloads: list[dict[str, Any]], output_dir: Path
+) -> list[Path]:
     if not payloads:
         return []
     latest = _latest_payload(payloads)
@@ -369,11 +408,39 @@ def _plot_validate_correction_theory(payloads: list[dict[str, Any]], output_dir:
     axes[0].set_ylabel("held-out normalized logit error")
     axes[1].plot(
         [int(row["rank"]) for row in ordered],
-        [float(row["expected_rejection_sampling_acceptance"]) for row in ordered],
+        [
+            float(
+                row.get("prompt_cluster_bootstrap", {})
+                .get("rejection_sampling_acceptance", {})
+                .get("estimate", row["expected_rejection_sampling_acceptance"])
+            )
+            for row in ordered
+        ],
         marker="o",
         color="#0f766e",
         label="exact expected acceptance",
     )
+    acceptance_intervals = [
+        row.get("prompt_cluster_bootstrap", {}).get("rejection_sampling_acceptance")
+        for row in ordered
+    ]
+    if all(isinstance(interval, dict) for interval in acceptance_intervals):
+        estimates = np.asarray([float(interval["estimate"]) for interval in acceptance_intervals])
+        axes[1].errorbar(
+            [int(row["rank"]) for row in ordered],
+            estimates,
+            yerr=np.asarray(
+                [
+                    estimates
+                    - np.asarray([float(interval["lower"]) for interval in acceptance_intervals]),
+                    np.asarray([float(interval["upper"]) for interval in acceptance_intervals])
+                    - estimates,
+                ]
+            ),
+            fmt="none",
+            capsize=3,
+            color="#0f766e",
+        )
     axes[1].plot(
         [int(row["rank"]) for row in ordered],
         [float(row["logit_acceptance_lower_bound"]) for row in ordered],
@@ -404,14 +471,54 @@ def _plot_phase_transition_sweep(payloads: list[dict[str, Any]], output_dir: Pat
         return []
     figure, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     scales = [float(row["magnitude_scale"]) for row in rows]
+    heldout_values = [
+        float(
+            row.get(
+                "heldout_prompt_weighted_normalized_logit_error",
+                row["heldout_normalized_logit_error"],
+            )
+        )
+        for row in rows
+    ]
     axes[0].plot(
         scales,
-        [float(row["heldout_normalized_logit_error"]) for row in rows],
+        heldout_values,
         marker="o",
         label="held-out logit error",
         color="#1d4ed8",
     )
-    axes[0].plot(scales, [float(row["nonlinearity_frobenius_fraction"]) for row in rows], marker="o", label="nonlinearity", color="#b45309")
+    intervals = [row.get("heldout_prompt_cluster_bootstrap") for row in rows]
+    if all(isinstance(interval, dict) for interval in intervals):
+        estimates = np.asarray(heldout_values)
+        axes[0].errorbar(
+            scales,
+            estimates,
+            yerr=np.asarray(
+                [
+                    estimates - np.asarray([float(interval["lower"]) for interval in intervals]),
+                    np.asarray([float(interval["upper"]) for interval in intervals]) - estimates,
+                ]
+            ),
+            fmt="none",
+            capsize=3,
+            color="#1d4ed8",
+        )
+    breakpoint = latest.get("breakpoint_analysis")
+    if isinstance(breakpoint, dict):
+        axes[0].axvline(
+            float(breakpoint["breakpoint"]),
+            linestyle="--",
+            color="#7c2d12",
+            linewidth=1.2,
+            label=f"exploratory break, ΔBIC={float(breakpoint['bic_improvement']):.1f}",
+        )
+    axes[0].plot(
+        scales,
+        [float(row["nonlinearity_frobenius_fraction"]) for row in rows],
+        marker="o",
+        label="nonlinearity",
+        color="#b45309",
+    )
     axes[0].set_title("Error Growth vs Adapter Magnitude")
     axes[0].set_xlabel("Magnitude scale")
     axes[0].set_ylabel("relative error")
@@ -435,7 +542,9 @@ def _plot_subspace_sharing(payloads: list[dict[str, Any]], output_dir: Path) -> 
     rows = latest.get("rows", [])
     if not rows:
         return []
-    adapter_names = sorted({str(row["adapter_a"]) for row in rows} | {str(row["adapter_b"]) for row in rows})
+    adapter_names = sorted(
+        {str(row["adapter_a"]) for row in rows} | {str(row["adapter_b"]) for row in rows}
+    )
     index = {name: position for position, name in enumerate(adapter_names)}
     matrix = np.ones((len(adapter_names), len(adapter_names)), dtype=np.float64)
     for row in rows:
@@ -483,21 +592,46 @@ def main() -> None:
 
     plot_paths: list[str] = []
     plot_paths.extend(str(path) for path in _plot_phase1(categorized["phase1"], output_dir))
-    plot_paths.extend(str(path) for path in _plot_characterize(categorized["characterize"], output_dir))
+    plot_paths.extend(
+        str(path) for path in _plot_characterize(categorized["characterize"], output_dir)
+    )
     plot_paths.extend(str(path) for path in _plot_predictive(categorized["predictive"], output_dir))
     plot_paths.extend(str(path) for path in _plot_correction(categorized["correction"], output_dir))
     plot_paths.extend(str(path) for path in _plot_serving(categorized["serving"], output_dir))
-    plot_paths.extend(str(path) for path in _plot_measure_logit_shift_rank(categorized["measure_logit_shift_rank"], output_dir))
-    plot_paths.extend(str(path) for path in _plot_validate_correction_theory(categorized["validate_correction_theory"], output_dir))
-    plot_paths.extend(str(path) for path in _plot_phase_transition_sweep(categorized["phase_transition_sweep"], output_dir))
-    plot_paths.extend(str(path) for path in _plot_subspace_sharing(categorized["subspace_sharing"], output_dir))
+    plot_paths.extend(
+        str(path)
+        for path in _plot_measure_logit_shift_rank(
+            categorized["measure_logit_shift_rank"], output_dir
+        )
+    )
+    plot_paths.extend(
+        str(path)
+        for path in _plot_validate_correction_theory(
+            categorized["validate_correction_theory"], output_dir
+        )
+    )
+    plot_paths.extend(
+        str(path)
+        for path in _plot_phase_transition_sweep(categorized["phase_transition_sweep"], output_dir)
+    )
+    plot_paths.extend(
+        str(path) for path in _plot_subspace_sharing(categorized["subspace_sharing"], output_dir)
+    )
 
     if not plot_paths:
         raise ValueError("No supported result payloads were found for plotting")
 
     manifest = {
         "plots": plot_paths,
+        "plot_sha256": {
+            path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in plot_paths
+        },
         "input_files_by_category": dict(used_paths),
+        "input_sha256": {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in input_paths
+            if str(path) in {used for paths in used_paths.values() for used in paths}
+        },
     }
     result_path = write_json_result(
         payload=manifest,
@@ -507,6 +641,7 @@ def main() -> None:
             "input_dir": str(input_dir),
             "glob": glob_pattern,
             "explicit_inputs": explicit_inputs,
+            "input_sha256": manifest["input_sha256"],
         },
         cwd=Path.cwd(),
     )

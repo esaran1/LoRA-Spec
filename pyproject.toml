@@ -13,20 +13,22 @@ authors = [{ name = "LoRA-Spec Authors" }]
 dependencies = [
   "numpy==1.26.4",
   "pandas==2.2.2",
-  "pydantic==2.7.4",
+  "pydantic==2.12.5",
   "pyyaml==6.0.1",
-  "torch==2.3.1",
-  "transformers==4.43.3",
-  "peft==0.11.1",
+  "torch==2.9.1",
+  "transformers==4.57.3",
+  "peft==0.18.0",
   "datasets==2.19.2",
-  "safetensors==0.4.3",
+  "safetensors==0.7.0",
   "matplotlib==3.8.4",
-  "huggingface-hub==0.23.4",
+  "huggingface-hub==0.36.0",
 ]
 
 [project.optional-dependencies]
 dev = [
+  "build==1.2.2.post1",
   "pytest==8.2.2",
+  "ruff==0.15.6",
 ]
 analysis = [
   "jupyter==1.0.0",
@@ -34,8 +36,8 @@ analysis = [
   "seaborn==0.13.2",
 ]
 colab = [
-  "vllm==0.5.3post1",
-  "accelerate==0.31.0",
+  "vllm==0.15.1",
+  "accelerate==1.12.0",
   "jupyter==1.0.0",
 ]
 

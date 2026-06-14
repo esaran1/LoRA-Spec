@@ -12,11 +12,12 @@ The repository supports three core claims:
 
 1. Determine when the empirical logit-shift matrix is low-rank or near-low-rank.
 2. Evaluate a PCA-output-subspace ridge operator whose calibration residual decomposes into spectral-tail and coefficient-regression terms.
-3. There is a phase boundary where the shift becomes too nonlinear or too large for analytical correction, and training becomes necessary.
+3. Test whether a reproducible regime boundary exists where the shift becomes too nonlinear or too large for analytical correction, and training becomes necessary.
 
 System benchmarks remain in the repo, but they now validate the theoretical story rather than define it.
 
 All logit-space rank results use a row-mean-centered gauge because softmax distributions are invariant to a per-context scalar offset. Correction operators are calibrated on `adapted target - base target`; draft outputs are application-time features, not part of the adapter-shift definition.
+The context distribution is also explicit: the base target greedily generates a frozen continuation trajectory, and measurements begin at the final prompt token that predicts the first continuation token. Prompt-interior teacher-forced logits are not used as a proxy for speculative proposal contexts.
 
 ## Setup
 
@@ -73,6 +74,19 @@ python scripts/measure_logit_shift_rank.py \
 ```
 
 When the exact full-vocabulary matrix exceeds the configured memory limit, the script uses independent Gaussian sketches and reports all sketch-level rank estimates and ranges. Those outputs are explicitly marked approximate.
+Use `--projection-dimensions 128,256,512` for the required projection-dimension sensitivity check. Repeated sketches estimate sketch randomness; varying the projection dimension tests compression bias.
+The artifact also reports the matrix rank ceiling and nested prompt-sample-size sensitivity. An effective rank near the row ceiling is inconclusive evidence of low rank and requires a larger calibration set.
+
+Audit the configured factorial coverage before interpreting a sweep as paper evidence:
+
+```bash
+python scripts/validate_experiment_design.py \
+  --adapters-config configs/adapters.yaml \
+  --strict \
+  --verbose
+```
+
+The checked-in adapter manifest is intentionally labeled `pilot` and does not pass strict mode. It contains magnitude controls for early theory validation, not the fully crossed rank/domain/epoch/model design required for causal comparisons.
 
 Validate the exact rejection-sampling overlap identity and the residual-logit lower bound against held-out acceptance:
 
@@ -99,6 +113,8 @@ python scripts/phase_transition_sweep.py \
   --verbose
 ```
 
+The sweep reports prompt-cluster bootstrap intervals and an exploratory continuous segmented-regression breakpoint. A positive BIC improvement supports curvature over a single linear trend; it is not by itself proof of a sharp phase transition.
+
 Measure shared dominant subspaces across adapters:
 
 ```bash
@@ -117,6 +133,21 @@ python scripts/subspace_sharing.py \
 - `scripts/analytical_correction.py`: single-run correction evaluation with theory-grounded operators
 - `scripts/train_micro_lora.py`: training-based upper bound when analytical correction breaks down
 - `scripts/benchmark_serving.py`: multi-tenant serving experiments
+
+Distillation uses the frozen calibration split, and serving uses the frozen evaluation split. Both resolve model and adapter references to immutable revisions. The current vLLM rejection-sampler hook supports only single-process acceptance measurement; tensor-parallel 70B jobs are limited to theory/model-analysis experiments until worker-side metric reduction is implemented.
+
+HTTP serving requires adapters preloaded with vLLM `--lora-modules`, unique `--adapter-model-name` values, and a matching `--server-provenance-json`. Both conditions are warmed, and request failures invalidate the run.
+
+Predictive input rows must include `features`, `target`, `adapter_source`, and `model_family`. Publication-facing metrics use grouped source-held-out and model-family-held-out evaluation; row-wise LOOCV is retained only as a diagnostic.
+
+Build those rows directly from immutable characterization and adapter-property artifacts:
+
+```bash
+python scripts/build_predictive_dataset.py \
+  --characterize-json results/characterize/<aggregate>.json \
+  --adapter-props-dir results/adapter_props \
+  --verbose
+```
 
 ## Plotting
 
@@ -139,3 +170,5 @@ python scripts/plot_results.py \
 ## Artifact Reproduction
 
 See [ARTIFACT.md](ARTIFACT.md) for figure-by-figure reproduction commands.
+
+The baseline manifest explicitly marks registered external methods that are not yet integrated as disabled. Do not report autoregressive, DistillSpec-style, or EAGLE-family comparisons until their entries are runnable and their provenance is captured by the same artifact path.

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import os
 import random
 import statistics
 import threading
@@ -8,12 +11,14 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from datasets import load_dataset
-
 from .metrics import SpeculativeDecodingMetrics, collect_speculative_metrics
+
+
+_VLLM_MAX_LORA_RANKS = (1, 8, 16, 32, 64, 128, 256, 320, 512)
 
 
 @dataclass
@@ -29,6 +34,7 @@ class TrafficRequest:
     tenant_id: str
     prompt: str
     adapter_path: str | None = None
+    adapter_model_name: str | None = None
     arrival_offset_s: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -45,12 +51,29 @@ class TrafficPatternConfig:
     request_spacing_s: float = 0.02
     seed: int = 7
 
+    def __post_init__(self) -> None:
+        if self.pattern not in {"uniform", "skewed_80_20", "bursty"}:
+            raise ValueError(f"Unsupported traffic pattern: {self.pattern}")
+        if self.concurrency < 1:
+            raise ValueError("concurrency must be >= 1")
+        if self.requests_per_tenant < 1:
+            raise ValueError("requests_per_tenant must be >= 1")
+        if not 0.0 < self.hot_tenant_fraction <= 1.0:
+            raise ValueError("hot_tenant_fraction must lie in (0, 1]")
+        if not 0.0 <= self.hot_request_fraction <= 1.0:
+            raise ValueError("hot_request_fraction must lie in [0, 1]")
+        if self.burst_size < 1:
+            raise ValueError("burst_size must be >= 1")
+        if self.burst_gap_s < 0.0 or self.request_spacing_s < 0.0:
+            raise ValueError("arrival timing parameters must be non-negative")
+
 
 @dataclass
 class RequestBenchmarkResult:
     request_id: str
     tenant_id: str
     adapter_path: str | None
+    adapter_model_name: str | None
     latency_ms: float
     output_tokens: int
     text: str
@@ -73,9 +96,46 @@ class TrafficBenchmarkResult:
     request_results: list[RequestBenchmarkResult]
 
 
+def load_and_verify_server_provenance(
+    path: str,
+    expected_artifacts: dict[str, Any],
+    adapter_model_names: list[str],
+) -> tuple[dict[str, Any], str]:
+    provenance_path = Path(path)
+    payload = json.loads(provenance_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Server provenance JSON must contain an object")
+    if not payload.get("vllm_version"):
+        raise ValueError("Server provenance must record vllm_version")
+    if payload.get("artifact_provenance") != expected_artifacts:
+        raise ValueError(
+            "Server artifact provenance does not exactly match the client-resolved artifacts"
+        )
+    if payload.get("adapter_model_names", []) != adapter_model_names:
+        raise ValueError("Server adapter_model_names do not match the benchmark configuration")
+    return payload, hashlib.sha256(provenance_path.read_bytes()).hexdigest()
+
+
+def warmup_subset(requests: list[TrafficRequest], per_tenant: int) -> list[TrafficRequest]:
+    if per_tenant < 0:
+        raise ValueError("warmup_requests_per_tenant must be non-negative")
+    selected: list[TrafficRequest] = []
+    counts: dict[str, int] = {}
+    for request in requests:
+        count = counts.get(request.tenant_id, 0)
+        if count < per_tenant:
+            selected.append(replace(request, arrival_offset_s=0.0))
+            counts[request.tenant_id] = count + 1
+    return selected
+
+
 def _infer_text_field(sample: dict[str, Any]) -> str:
     for field_name in ("text", "prompt", "instruction", "question", "content"):
-        if field_name in sample and isinstance(sample[field_name], str) and sample[field_name].strip():
+        if (
+            field_name in sample
+            and isinstance(sample[field_name], str)
+            and sample[field_name].strip()
+        ):
             return field_name
     if {"instruction", "input"} <= set(sample):
         return "instruction"
@@ -89,9 +149,16 @@ def load_prompts(
     split: str = "train",
     text_field: str | None = None,
 ) -> list[str]:
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError("datasets is required to load prompts from the Hugging Face Hub") from exc
+
     dataset = load_dataset(dataset_name, split=split)
     if len(dataset) < num_prompts:
-        raise ValueError(f"Dataset split {dataset_name}:{split} contains fewer than {num_prompts} rows")
+        raise ValueError(
+            f"Dataset split {dataset_name}:{split} contains fewer than {num_prompts} rows"
+        )
     indices = list(range(len(dataset)))
     random.Random(seed).shuffle(indices)
     selected = dataset.select(indices[:num_prompts])
@@ -119,8 +186,22 @@ def initialize_vllm(
     gpu_memory_utilization: float = 0.85,
     speculation_length: int = 4,
     enable_lora: bool = False,
+    max_lora_rank: int = 16,
     trust_remote_code: bool = False,
-):
+) -> Any:
+    if max_lora_rank < 1:
+        raise ValueError("max_lora_rank must be positive")
+    compatible_max_lora_rank = next(
+        (rank for rank in _VLLM_MAX_LORA_RANKS if rank >= max_lora_rank),
+        None,
+    )
+    if compatible_max_lora_rank is None:
+        raise ValueError(
+            f"max_lora_rank exceeds vLLM's supported ceiling {_VLLM_MAX_LORA_RANKS[-1]}"
+        )
+    # The sampler hook is process-local. Keeping the V1 engine core in-process
+    # makes acceptance decisions observable and avoids silently empty metrics.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     try:
         from vllm import LLM
     except ImportError as exc:  # pragma: no cover - requires vLLM runtime
@@ -128,12 +209,16 @@ def initialize_vllm(
 
     return LLM(
         model=target_model,
-        speculative_model=draft_model,
-        num_speculative_tokens=speculation_length,
+        speculative_config={
+            "model": draft_model,
+            "method": "draft_model",
+            "num_speculative_tokens": speculation_length,
+        },
         tensor_parallel_size=tensor_parallel_size,
         max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization,
         enable_lora=enable_lora,
+        max_lora_rank=compatible_max_lora_rank,
         trust_remote_code=trust_remote_code,
     )
 
@@ -142,7 +227,7 @@ def build_sampling_params(
     max_tokens: int = 128,
     temperature: float = 0.0,
     top_p: float = 1.0,
-):
+) -> Any:
     try:
         from vllm import SamplingParams
     except ImportError as exc:  # pragma: no cover - requires vLLM runtime
@@ -166,7 +251,9 @@ def run_speculative_generation(
         try:
             from vllm.lora.request import LoRARequest
         except ImportError as exc:  # pragma: no cover - requires vLLM runtime
-            raise ImportError("vLLM LoRA support is required when adapter_path is provided") from exc
+            raise ImportError(
+                "vLLM LoRA support is required when adapter_path is provided"
+            ) from exc
         lora_request = LoRARequest("lora-spec-adapter", 1, adapter_path)
 
     def _generate() -> list[Any]:
@@ -196,10 +283,18 @@ def build_traffic_requests(
     prompts: Sequence[str],
     adapter_paths: Sequence[str | None],
     config: TrafficPatternConfig,
+    adapter_model_names: Sequence[str | None] | None = None,
 ) -> list[TrafficRequest]:
     if not prompts:
         raise ValueError("prompts must not be empty")
     tenant_adapters = list(adapter_paths) or [None]
+    tenant_model_names = (
+        list(adapter_model_names)
+        if adapter_model_names is not None
+        else [None] * len(tenant_adapters)
+    )
+    if len(tenant_model_names) != len(tenant_adapters):
+        raise ValueError("adapter_model_names must match adapter_paths length")
     tenant_ids = [f"tenant_{index:02d}" for index in range(len(tenant_adapters))]
     total_requests = config.requests_per_tenant * len(tenant_ids)
     prompt_sequence = _cycle_values(list(prompts), total_requests)
@@ -225,13 +320,16 @@ def build_traffic_requests(
         arrival_offsets = []
         for index in range(total_requests):
             burst_index = index // max(config.burst_size, 1)
-            within_burst = (index % max(config.burst_size, 1)) * min(config.request_spacing_s, 0.005)
+            within_burst = (index % max(config.burst_size, 1)) * min(
+                config.request_spacing_s, 0.005
+            )
             arrival_offsets.append((burst_index * config.burst_gap_s) + within_burst)
     else:
         raise ValueError(f"Unsupported traffic pattern: {config.pattern}")
 
     requests: list[TrafficRequest] = []
     adapter_by_tenant = dict(zip(tenant_ids, tenant_adapters))
+    model_name_by_tenant = dict(zip(tenant_ids, tenant_model_names))
     for index in range(total_requests):
         tenant_id = tenant_sequence[index]
         requests.append(
@@ -240,6 +338,7 @@ def build_traffic_requests(
                 tenant_id=tenant_id,
                 prompt=prompt_sequence[index],
                 adapter_path=adapter_by_tenant[tenant_id],
+                adapter_model_name=model_name_by_tenant[tenant_id],
                 arrival_offset_s=arrival_offsets[index],
                 metadata={"pattern": config.pattern},
             )
@@ -259,10 +358,12 @@ def create_local_request_executor(
             try:
                 from vllm.lora.request import LoRARequest
             except ImportError as exc:  # pragma: no cover - requires vLLM runtime
-                raise ImportError("vLLM LoRA support is required when adapter_path is provided") from exc
+                raise ImportError(
+                    "vLLM LoRA support is required when adapter_path is provided"
+                ) from exc
             lora_request = LoRARequest(
                 f"tenant-{request.tenant_id}",
-                abs(hash(request.tenant_id)) % 1_000_000 + 1,
+                _stable_lora_id(request.tenant_id),
                 request.adapter_path,
             )
         with llm_lock:
@@ -294,20 +395,12 @@ def create_openai_server_request_executor(
 
     def execute(request: TrafficRequest) -> tuple[str, int]:
         payload: dict[str, Any] = {
-            "model": model,
+            "model": request.adapter_model_name or model,
             "prompt": request.prompt,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
         }
-        if request.adapter_path is not None:
-            payload["extra_body"] = {
-                "lora_request": {
-                    "lora_name": f"tenant-{request.tenant_id}",
-                    "lora_int_id": abs(hash(request.tenant_id)) % 1_000_000 + 1,
-                    "lora_path": request.adapter_path,
-                }
-            }
         http_request = urllib.request.Request(
             endpoint,
             data=json.dumps(payload).encode("utf-8"),
@@ -333,10 +426,35 @@ def create_openai_server_request_executor(
     return execute
 
 
+def _stable_lora_id(tenant_id: str) -> int:
+    digest = hashlib.sha256(tenant_id.encode("utf-8")).digest()
+    identifier = int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+    return identifier or 1
+
+
+def linear_percentile(values: Sequence[float], quantile: float) -> float:
+    """Return the Hyndman-Fan type-7 sample percentile used by NumPy."""
+    if not values:
+        raise ValueError("values must not be empty")
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must lie in [0, 1]")
+    ordered = sorted(float(value) for value in values)
+    if not all(math.isfinite(value) for value in ordered):
+        raise ValueError("values must be finite")
+    position = quantile * (len(ordered) - 1)
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    fraction = position - lower_index
+    return ordered[lower_index] + fraction * (ordered[upper_index] - ordered[lower_index])
+
+
 def run_concurrent_benchmark(
     requests: Sequence[TrafficRequest],
     executor: Callable[[TrafficRequest], tuple[str, int]],
     concurrency: int,
+    fail_on_error: bool = True,
 ) -> TrafficBenchmarkResult:
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
@@ -356,6 +474,7 @@ def run_concurrent_benchmark(
                 request_id=request.request_id,
                 tenant_id=request.tenant_id,
                 adapter_path=request.adapter_path,
+                adapter_model_name=request.adapter_model_name,
                 latency_ms=latency_ms,
                 output_tokens=token_count,
                 text=text,
@@ -366,6 +485,7 @@ def run_concurrent_benchmark(
                 request_id=request.request_id,
                 tenant_id=request.tenant_id,
                 adapter_path=request.adapter_path,
+                adapter_model_name=request.adapter_model_name,
                 latency_ms=latency_ms,
                 output_tokens=0,
                 text="",
@@ -381,6 +501,12 @@ def run_concurrent_benchmark(
     wall_time_s = time.perf_counter() - benchmark_start
     request_results.sort(key=lambda item: item.request_id)
     completed = [result for result in request_results if result.error is None]
+    failed = [result for result in request_results if result.error is not None]
+    if failed and fail_on_error:
+        examples = "; ".join(f"{result.request_id}: {result.error}" for result in failed[:3])
+        raise RuntimeError(
+            f"Serving benchmark failed {len(failed)}/{len(request_results)} requests; {examples}"
+        )
     latencies = [result.latency_ms for result in completed]
     total_tokens = sum(result.output_tokens for result in completed)
     per_tenant_counts: dict[str, int] = {}
@@ -389,11 +515,7 @@ def run_concurrent_benchmark(
 
     if latencies:
         p50_latency = float(statistics.median(latencies))
-        if len(latencies) == 1:
-            p95_latency = latencies[0]
-        else:
-            p95_index = max(0, min(len(latencies) - 1, int(round(0.95 * (len(latencies) - 1)))))
-            p95_latency = sorted(latencies)[p95_index]
+        p95_latency = linear_percentile(latencies, 0.95)
     else:
         p50_latency = 0.0
         p95_latency = 0.0

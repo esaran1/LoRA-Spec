@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import random
-import statistics
 from pathlib import Path
 from typing import Any
 
-from lora_spec.adapter_props import read_adapter_metadata
+from lora_spec.adapter_props import read_adapter_metadata, validate_plain_lora_config
 from lora_spec.artifacts import materialize_artifact, resolve_artifact_revision
 from lora_spec.config import AdapterConfig, ExperimentConfig, ModelPairConfig, ResultRecord
-from lora_spec.metrics import AcceptanceMetrics, SpeculativeDecodingMetrics, TimingMetrics
+from lora_spec.metrics import SpeculativeDecodingMetrics, aggregate_speculative_metrics
 from lora_spec.prompts import prompt_file_provenance, resolve_registered_prompt_split
 from lora_spec.serving import (
     build_sampling_params,
@@ -22,6 +20,7 @@ from lora_spec.utils import (
     add_common_args,
     compute_config_hash,
     get_config_value,
+    mean_ci95,
     resolve_config,
     set_seed,
     setup_logging,
@@ -29,7 +28,9 @@ from lora_spec.utils import (
 )
 
 
-def build_experiment_config(args: argparse.Namespace, config_data: dict[str, Any]) -> ExperimentConfig:
+def build_experiment_config(
+    args: argparse.Namespace, config_data: dict[str, Any]
+) -> ExperimentConfig:
     target_model = get_config_value(config_data, args, "target_model")
     draft_model = get_config_value(config_data, args, "draft_model")
     adapter_path = get_config_value(config_data, args, "adapter_path")
@@ -50,6 +51,7 @@ def build_experiment_config(args: argparse.Namespace, config_data: dict[str, Any
             str(adapter_path),
             revision=get_config_value(config_data, args, "adapter_revision"),
         )
+        validate_plain_lora_config(adapter_metadata, context="Phase 1 acceptance measurement")
         configured_rank = config_data.get("adapter_rank", args.adapter_rank)
         metadata_rank = adapter_metadata.get("r")
         if configured_rank is None and metadata_rank is None:
@@ -62,7 +64,9 @@ def build_experiment_config(args: argparse.Namespace, config_data: dict[str, Any
         metadata_base = adapter_metadata.get("base_model_name_or_path")
         if isinstance(metadata_base, str) and metadata_base and not metadata_base.startswith("/"):
             if metadata_base != str(target_model):
-                raise ValueError(f"Adapter targets {metadata_base}, but target_model is {target_model}")
+                raise ValueError(
+                    f"Adapter targets {metadata_base}, but target_model is {target_model}"
+                )
         adapter = AdapterConfig(
             rank=adapter_rank,
             domain=str(config_data.get("adapter_domain", args.adapter_domain or "unknown")),
@@ -103,6 +107,9 @@ def make_result_record(
         "accepted_drafted_tokens": metrics.acceptance.accepted_drafted_tokens,
         "total_drafted_tokens": metrics.acceptance.total_drafted_tokens,
         "bonus_tokens": metrics.acceptance.bonus_tokens,
+        "acceptance_by_depth": metrics.acceptance.acceptance_by_depth,
+        "depth_attempts": metrics.acceptance.depth_attempts,
+        "depth_accepted": metrics.acceptance.depth_accepted,
     }
     return ResultRecord(
         config_hash=config_hash,
@@ -114,84 +121,10 @@ def make_result_record(
     )
 
 
-def _mean_ci95(values: list[float]) -> tuple[float, float, float]:
-    if not values:
-        raise ValueError("Cannot summarize an empty measurement list")
-    mean = statistics.mean(values)
-    if len(values) == 1:
-        return float(mean), float(mean), float(mean)
-    standard_error = statistics.stdev(values) / math.sqrt(len(values))
-    t_critical_by_degrees_of_freedom = {
-        1: 12.706,
-        2: 4.303,
-        3: 3.182,
-        4: 2.776,
-        5: 2.571,
-        6: 2.447,
-        7: 2.365,
-        8: 2.306,
-        9: 2.262,
-        10: 2.228,
-        15: 2.131,
-        20: 2.086,
-        30: 2.042,
-    }
-    degrees_of_freedom = len(values) - 1
-    eligible = [key for key in t_critical_by_degrees_of_freedom if key <= degrees_of_freedom]
-    critical_value = (
-        t_critical_by_degrees_of_freedom[max(eligible)] if eligible else 12.706
-    )
-    half_width = critical_value * standard_error
-    return float(mean), float(mean - half_width), float(mean + half_width)
-
-
 def _aggregate_metrics(runs: list[Any]) -> SpeculativeDecodingMetrics:
     if not runs:
         raise ValueError("At least one measured run is required")
-    metrics = [run.metrics for run in runs]
-    maximum_positions = max(len(item.acceptance.per_position_attempts) for item in metrics)
-    attempts = [0] * maximum_positions
-    accepted = [0] * maximum_positions
-    depth_numerators = [0.0] * maximum_positions
-    depth_denominators = [0] * maximum_positions
-    for item in metrics:
-        for index, count in enumerate(item.acceptance.per_position_attempts):
-            attempts[index] += count
-            accepted[index] += item.acceptance.per_position_accepted[index]
-        for index, rate in enumerate(item.acceptance.acceptance_by_depth):
-            depth_numerators[index] += rate * item.acceptance.speculative_steps
-            depth_denominators[index] += item.acceptance.speculative_steps
-    total_drafted = sum(item.acceptance.total_drafted_tokens for item in metrics)
-    total_accepted = sum(item.acceptance.accepted_drafted_tokens for item in metrics)
-    ttft_values = [item.timing.ttft_ms for item in metrics if math.isfinite(item.timing.ttft_ms)]
-    backends = sorted({item.instrumentation_backend for item in metrics})
-    return SpeculativeDecodingMetrics(
-        acceptance=AcceptanceMetrics(
-            overall_acceptance_rate=total_accepted / max(total_drafted, 1),
-            per_position_acceptance_rate=[
-                accepted_count / attempt_count if attempt_count else 0.0
-                for accepted_count, attempt_count in zip(accepted, attempts)
-            ],
-            per_position_attempts=attempts,
-            per_position_accepted=accepted,
-            acceptance_by_depth=[
-                numerator / denominator if denominator else 0.0
-                for numerator, denominator in zip(depth_numerators, depth_denominators)
-            ],
-            accepted_drafted_tokens=total_accepted,
-            total_drafted_tokens=total_drafted,
-            bonus_tokens=sum(item.acceptance.bonus_tokens for item in metrics),
-            speculative_steps=sum(item.acceptance.speculative_steps for item in metrics),
-        ),
-        timing=TimingMetrics(
-            throughput_tps=statistics.mean(item.timing.throughput_tps for item in metrics),
-            ttft_ms=statistics.mean(ttft_values) if ttft_values else float("nan"),
-            total_generated_tokens=sum(item.timing.total_generated_tokens for item in metrics),
-            wall_time_s=sum(item.timing.wall_time_s for item in metrics),
-        ),
-        instrumentation_backend=",".join(backends),
-        raw_decisions=[decision for item in metrics for decision in item.raw_decisions],
-    )
+    return aggregate_speculative_metrics([run.metrics for run in runs])
 
 
 def hypothesis_recommendation(
@@ -214,6 +147,12 @@ def run_validation(
     logger: logging.Logger,
 ) -> dict[str, Any]:
     set_seed(experiment.seed)
+    if experiment.model_pair.tensor_parallel_degree != 1:
+        raise ValueError(
+            "Acceptance instrumentation is process-local and currently supports only "
+            "tensor_parallel_degree=1. Use measure_logit_shift_rank.py for multi-GPU theory "
+            "experiments, or implement worker-side metric reduction before claiming TP acceptance."
+        )
     llm = initialize_vllm(
         target_model=target_load_path,
         draft_model=draft_load_path,
@@ -221,6 +160,7 @@ def run_validation(
         gpu_memory_utilization=experiment.gpu_memory_utilization,
         speculation_length=experiment.speculation_length,
         enable_lora=adapter_path is not None,
+        max_lora_rank=experiment.adapter.rank if experiment.adapter is not None else 16,
         trust_remote_code=experiment.trust_remote_code,
     )
     sampling_params = build_sampling_params(max_tokens=experiment.max_tokens)
@@ -278,7 +218,9 @@ def run_validation(
         adapted_metrics.acceptance.overall_acceptance_rate
         - baseline_metrics.acceptance.overall_acceptance_rate
     )
-    throughput_delta = adapted_metrics.timing.throughput_tps - baseline_metrics.timing.throughput_tps
+    throughput_delta = (
+        adapted_metrics.timing.throughput_tps - baseline_metrics.timing.throughput_tps
+    )
     acceptance_deltas = [
         adapted_run.metrics.acceptance.overall_acceptance_rate
         - baseline_run.metrics.acceptance.overall_acceptance_rate
@@ -289,8 +231,8 @@ def run_validation(
         / max(baseline_run.metrics.timing.throughput_tps, 1e-12)
         for baseline_run, adapted_run in zip(measured_runs["baseline"], measured_runs["adapted"])
     ]
-    acceptance_delta_ci95 = _mean_ci95(acceptance_deltas)
-    throughput_relative_delta_ci95 = _mean_ci95(throughput_relative_deltas)
+    acceptance_delta_ci95 = mean_ci95(acceptance_deltas)
+    throughput_relative_delta_ci95 = mean_ci95(throughput_relative_deltas)
     recommendation = hypothesis_recommendation(
         acceptance_delta_ci95,
         throughput_relative_delta_ci95,
@@ -368,9 +310,7 @@ def run_validation(
                         index
                     ].metrics.timing.throughput_tps,
                     "throughput_relative_delta": throughput_relative_deltas[index],
-                    "baseline_ttft_ms": measured_runs["baseline"][
-                        index
-                    ].metrics.timing.ttft_ms,
+                    "baseline_ttft_ms": measured_runs["baseline"][index].metrics.timing.ttft_ms,
                     "adapted_ttft_ms": measured_runs["adapted"][index].metrics.timing.ttft_ms,
                 }
                 for index in range(experiment.measurement_repetitions)
@@ -421,7 +361,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.verbose, logger_name="validate_hypothesis")
-    set_seed(args.seed)
     config_data = resolve_config(args.config, args.override)
     target_model = get_config_value(config_data, args, "target_model")
     draft_model = get_config_value(config_data, args, "draft_model")
@@ -449,6 +388,7 @@ def main() -> None:
         },
     )
     experiment = build_experiment_config(args, resolved_config)
+    set_seed(experiment.seed)
 
     prompts_file = str(get_config_value(resolved_config, args, "prompts_file"))
     registered = resolve_registered_prompt_split(prompts_file, expected_split="evaluation")
@@ -459,7 +399,9 @@ def main() -> None:
         )
     selected_indices = list(range(len(registered.records)))
     random.Random(experiment.seed).shuffle(selected_indices)
-    selected_records = [registered.records[index] for index in selected_indices[: experiment.num_prompts]]
+    selected_records = [
+        registered.records[index] for index in selected_indices[: experiment.num_prompts]
+    ]
     prompts = [record.text for record in selected_records]
     prompt_metadata = {
         **prompt_file_provenance(prompts_file, expected_split="evaluation"),

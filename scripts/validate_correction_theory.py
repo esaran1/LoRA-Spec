@@ -1,20 +1,36 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
 
-from lora_spec.acceptance_theory import empirical_vs_predicted_recovery
+from lora_spec.acceptance_theory import (
+    acceptance_lower_bound_from_logit_residual,
+    empirical_vs_predicted_recovery,
+)
 from lora_spec.artifacts import resolve_artifact_revision, tokenizers_are_equivalent
 from lora_spec.correction import LowRankCorrection, MeanShiftCorrection
 from lora_spec.metrics import simulate_speculative_decoding
 from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
-from lora_spec.theory import center_logit_shift_rows, collect_logit_shift_dataset
+from lora_spec.statistical import cluster_bootstrap_mean
+from lora_spec.theory import (
+    ContinuationContextSet,
+    build_continuation_contexts,
+    center_logit_shift_rows,
+    collect_context_model_outputs,
+    collect_logit_shift_dataset,
+)
 from lora_spec.utils import (
     add_common_args,
     ensure_dir,
@@ -28,7 +44,9 @@ from lora_spec.utils import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate the low-rank correction theory against acceptance recovery.")
+    parser = argparse.ArgumentParser(
+        description="Validate the low-rank correction theory against acceptance recovery."
+    )
     add_common_args(parser)
     parser.add_argument("--base-model", type=str, default=None)
     parser.add_argument("--base-revision", type=str, default=None)
@@ -52,7 +70,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--speculation-length", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--continuation-tokens", type=int, default=16)
     parser.add_argument("--torch-dtype", type=str, default="auto")
+    parser.add_argument("--bootstrap-repetitions", type=int, default=2000)
     parser.add_argument("--output-dir", type=str, default="results/theory")
     return parser.parse_args()
 
@@ -78,12 +98,16 @@ def _load_model(
     torch_dtype: torch.dtype,
     revision: str | None = None,
 ) -> PreTrainedModel:
-    return AutoModelForCausalLM.from_pretrained(
-        model_name,
-        revision=revision,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-    ).to(device).eval()
+    return (
+        AutoModelForCausalLM.from_pretrained(
+            model_name,
+            revision=revision,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        )
+        .to(device)
+        .eval()
+    )
 
 
 def _load_adapted_model(
@@ -103,11 +127,15 @@ def _load_adapted_model(
             torch_dtype=torch_dtype,
             revision=base_revision,
         )
-        return PeftModel.from_pretrained(
-            base_model,
-            adapted_adapter_path,
-            revision=adapter_revision,
-        ).to(device).eval()
+        return (
+            PeftModel.from_pretrained(
+                base_model,
+                adapted_adapter_path,
+                revision=adapter_revision,
+            )
+            .to(device)
+            .eval()
+        )
     if adapted_model_name:
         return _load_model(
             adapted_model_name,
@@ -142,76 +170,87 @@ def _evaluate_divergence(
     tokenizer: PreTrainedTokenizerBase,
     prompts: list[str],
     batch_size: int,
-) -> dict[str, float]:
-    device = next(draft_model.parameters()).device
-    total_positions = 0
-    kl_sum = 0.0
-    baseline_residual_sum = 0.0
-    corrected_residual_sum = 0.0
-    total_variation_sum = 0.0
-    rejection_acceptance_sum = 0.0
-    logit_acceptance_lower_bound_sum = 0.0
-    residual_span_sum = 0.0
-
-    for start in range(0, len(prompts), batch_size):
-        batch_prompts = prompts[start : start + batch_size]
-        encoded = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True)
-        encoded = {name: tensor.to(device) for name, tensor in encoded.items()}
-        with torch.no_grad():
-            draft_outputs = draft_model(**encoded)
-            adapted_logits = adapted_model(**encoded).logits[:, :-1, :].float()
-        draft_logits = draft_outputs.logits[:, :-1, :].float()
-        adjusted_logits = draft_logits if correction is None else correction.apply(draft_logits)
-        adjusted_log_probs = F.log_softmax(adjusted_logits, dim=-1)
-        adapted_log_probs = F.log_softmax(adapted_logits, dim=-1)
-        adapted_probs = adapted_log_probs.exp()
-        adjusted_probs = adjusted_log_probs.exp()
-        mask = encoded["attention_mask"][:, 1:].bool()
-        positions = int(mask.sum().item())
-        if positions == 0:
-            continue
-        kl = torch.sum(adapted_probs * (adapted_log_probs - adjusted_log_probs), dim=-1)
-        total_variation = 0.5 * torch.sum(torch.abs(adapted_probs - adjusted_probs), dim=-1)
-        rejection_acceptance = torch.sum(torch.minimum(adapted_probs, adjusted_probs), dim=-1)
-        residual = adapted_logits - adjusted_logits
-        residual_span = residual.amax(dim=-1) - residual.amin(dim=-1)
-        logit_acceptance_lower_bound = 1.0 - torch.tanh(0.5 * residual_span)
-        expanded_mask = mask.unsqueeze(-1).expand_as(adapted_logits)
-        baseline_delta = center_logit_shift_rows(
-            (draft_logits - adapted_logits).reshape(-1, adapted_logits.shape[-1]),
-        ).reshape_as(adapted_logits)
-        corrected_delta = center_logit_shift_rows(
-            (adjusted_logits - adapted_logits).reshape(-1, adapted_logits.shape[-1]),
-        ).reshape_as(adapted_logits)
-        baseline_residual = baseline_delta.masked_select(expanded_mask)
-        corrected_residual = corrected_delta.masked_select(expanded_mask)
-        total_positions += positions
-        kl_sum += float(kl.masked_select(mask).sum().item())
-        total_variation_sum += float(total_variation.masked_select(mask).sum().item())
-        rejection_acceptance_sum += float(rejection_acceptance.masked_select(mask).sum().item())
-        logit_acceptance_lower_bound_sum += float(
-            logit_acceptance_lower_bound.masked_select(mask).sum().item()
-        )
-        residual_span_sum += float(residual_span.masked_select(mask).sum().item())
-        baseline_residual_sum += float(torch.sum(baseline_residual.square()).item())
-        corrected_residual_sum += float(torch.sum(corrected_residual.square()).item())
+    continuation_contexts: ContinuationContextSet,
+    bootstrap_repetitions: int,
+    bootstrap_seed: int,
+) -> dict[str, Any]:
+    _ = prompts
+    draft_logits, _, prompt_indices, _ = collect_context_model_outputs(
+        draft_model,
+        tokenizer,
+        continuation_contexts,
+        batch_size=batch_size,
+    )
+    adapted_logits, _, adapted_prompt_indices, _ = collect_context_model_outputs(
+        adapted_model,
+        tokenizer,
+        continuation_contexts,
+        batch_size=batch_size,
+    )
+    if prompt_indices != adapted_prompt_indices:
+        raise RuntimeError("Draft and adapted evaluation rows are not prompt-aligned")
+    adjusted_logits = draft_logits if correction is None else correction.apply(draft_logits)
+    adjusted_log_probs = F.log_softmax(adjusted_logits, dim=-1)
+    adapted_log_probs = F.log_softmax(adapted_logits, dim=-1)
+    adapted_probs = adapted_log_probs.exp()
+    adjusted_probs = adjusted_log_probs.exp()
+    kl = torch.sum(adapted_probs * (adapted_log_probs - adjusted_log_probs), dim=-1)
+    total_variation = 0.5 * torch.sum(torch.abs(adapted_probs - adjusted_probs), dim=-1)
+    rejection_acceptance = torch.sum(torch.minimum(adapted_probs, adjusted_probs), dim=-1)
+    residual = adapted_logits - adjusted_logits
+    residual_span = residual.amax(dim=-1) - residual.amin(dim=-1)
+    logit_acceptance_lower_bound = acceptance_lower_bound_from_logit_residual(
+        adapted_logits,
+        adjusted_logits,
+    )
+    baseline_residual = center_logit_shift_rows(draft_logits - adapted_logits)
+    corrected_residual = center_logit_shift_rows(adjusted_logits - adapted_logits)
+    total_positions = int(draft_logits.shape[0])
+    clustered_metrics = {
+        "kl_divergence": cluster_bootstrap_mean(
+            kl.cpu().numpy(), prompt_indices, bootstrap_repetitions, seed=bootstrap_seed
+        ),
+        "total_variation": cluster_bootstrap_mean(
+            total_variation.cpu().numpy(),
+            prompt_indices,
+            bootstrap_repetitions,
+            seed=bootstrap_seed + 1,
+        ),
+        "rejection_sampling_acceptance": cluster_bootstrap_mean(
+            rejection_acceptance.cpu().numpy(),
+            prompt_indices,
+            bootstrap_repetitions,
+            seed=bootstrap_seed + 2,
+        ),
+        "residual_logit_span": cluster_bootstrap_mean(
+            residual_span.cpu().numpy(),
+            prompt_indices,
+            bootstrap_repetitions,
+            seed=bootstrap_seed + 3,
+        ),
+        "logit_acceptance_lower_bound": cluster_bootstrap_mean(
+            logit_acceptance_lower_bound.cpu().numpy(),
+            prompt_indices,
+            bootstrap_repetitions,
+            seed=bootstrap_seed + 4,
+        ),
+    }
 
     return {
-        "kl_divergence": float(kl_sum / max(total_positions, 1)),
-        "mean_total_variation": float(total_variation_sum / max(total_positions, 1)),
-        "expected_rejection_sampling_acceptance": float(
-            rejection_acceptance_sum / max(total_positions, 1)
-        ),
-        "logit_acceptance_lower_bound": float(
-            logit_acceptance_lower_bound_sum / max(total_positions, 1)
-        ),
-        "logit_tv_upper_bound": float(
-            1.0 - (logit_acceptance_lower_bound_sum / max(total_positions, 1))
-        ),
-        "mean_residual_logit_span": float(residual_span_sum / max(total_positions, 1)),
+        "kl_divergence": float(kl.mean().item()),
+        "mean_total_variation": float(total_variation.mean().item()),
+        "expected_rejection_sampling_acceptance": float(rejection_acceptance.mean().item()),
+        "logit_acceptance_lower_bound": float(logit_acceptance_lower_bound.mean().item()),
+        "logit_tv_upper_bound": float(1.0 - logit_acceptance_lower_bound.mean().item()),
+        "mean_residual_logit_span": float(residual_span.mean().item()),
         "num_positions": float(total_positions),
+        "num_prompt_clusters": len(set(prompt_indices)),
+        "prompt_cluster_bootstrap": {
+            name: asdict(interval) for name, interval in clustered_metrics.items()
+        },
         "heldout_normalized_logit_error": float(
-            (corrected_residual_sum ** 0.5) / max(baseline_residual_sum ** 0.5, 1e-12),
+            torch.linalg.matrix_norm(corrected_residual, ord="fro").item()
+            / max(torch.linalg.matrix_norm(baseline_residual, ord="fro").item(), 1e-12),
         ),
     }
 
@@ -228,8 +267,9 @@ def _mean_shift_error(dataset: Any) -> float:
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.verbose, "validate_correction_theory")
-    set_seed(args.seed)
     config_data = resolve_config(args.config, args.override)
+    seed = int(get_config_value(config_data, args, "seed"))
+    set_seed(seed)
 
     base_model_value = get_config_value(config_data, args, "base_model")
     adapted_model_value = get_config_value(config_data, args, "adapted_model")
@@ -253,6 +293,10 @@ def main() -> None:
     batch_size = int(get_config_value(config_data, args, "batch_size"))
     speculation_length = int(get_config_value(config_data, args, "speculation_length"))
     max_new_tokens = int(get_config_value(config_data, args, "max_new_tokens"))
+    continuation_tokens = int(get_config_value(config_data, args, "continuation_tokens"))
+    bootstrap_repetitions = int(get_config_value(config_data, args, "bootstrap_repetitions"))
+    if bootstrap_repetitions < 1:
+        raise ValueError("bootstrap_repetitions must be positive")
     torch_dtype_name = str(get_config_value(config_data, args, "torch_dtype"))
     output_dir = str(get_config_value(config_data, args, "output_dir"))
     plots_dir = ensure_dir(Path(output_dir) / "plots")
@@ -281,8 +325,12 @@ def main() -> None:
     )
 
     tokenizer = _load_tokenizer(base_model_name, revision=base_artifact.revision_for_loading)
-    draft_tokenizer = _load_tokenizer(draft_model_name, revision=draft_artifact.revision_for_loading)
-    if not tokenizers_are_equivalent(tokenizer, draft_tokenizer, calibration_prompts + eval_prompts):
+    draft_tokenizer = _load_tokenizer(
+        draft_model_name, revision=draft_artifact.revision_for_loading
+    )
+    if not tokenizers_are_equivalent(
+        tokenizer, draft_tokenizer, calibration_prompts + eval_prompts
+    ):
         raise ValueError("draft_model tokenizer must be compatible with base_model tokenizer")
 
     logger.info("Loading models on %s", device)
@@ -295,18 +343,26 @@ def main() -> None:
     adapted_model = _load_adapted_model(
         base_model_name=base_model_name,
         adapted_model_name=str(adapted_model_value) if adapted_model_value else None,
-        adapted_adapter_path=str(adapted_adapter_path_value) if adapted_adapter_path_value else None,
+        adapted_adapter_path=str(adapted_adapter_path_value)
+        if adapted_adapter_path_value
+        else None,
         device=device,
         torch_dtype=torch_dtype,
         base_revision=base_artifact.revision_for_loading,
         adapted_revision=adapted_artifact.revision_for_loading if adapted_artifact else None,
         adapter_revision=adapter_artifact.revision_for_loading if adapter_artifact else None,
     )
-    draft_model = _load_model(
-        draft_model_name,
-        device,
-        torch_dtype=torch_dtype,
-        revision=draft_artifact.revision_for_loading,
+    calibration_contexts = build_continuation_contexts(
+        base_model,
+        tokenizer,
+        calibration_prompts,
+        max_new_tokens=continuation_tokens,
+    )
+    evaluation_contexts = build_continuation_contexts(
+        base_model,
+        tokenizer,
+        eval_prompts,
+        max_new_tokens=continuation_tokens,
     )
     calibration_dataset = collect_logit_shift_dataset(
         base_model=base_model,
@@ -315,9 +371,34 @@ def main() -> None:
         tokenizer=tokenizer,
         batch_size=batch_size,
         collect_hidden_states=False,
+        continuation_contexts=calibration_contexts,
     )
+    del base_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    draft_model = _load_model(
+        draft_model_name,
+        device,
+        torch_dtype=torch_dtype,
+        revision=draft_artifact.revision_for_loading,
+    )
+    calibration_feature_logits, _, feature_prompt_indices, feature_token_positions = (
+        collect_context_model_outputs(
+            draft_model,
+            draft_tokenizer,
+            calibration_contexts,
+            batch_size=batch_size,
+        )
+    )
+    if (
+        feature_prompt_indices != calibration_dataset.prompt_indices
+        or feature_token_positions != calibration_dataset.token_positions
+    ):
+        raise RuntimeError("Draft correction features are not aligned with calibration labels")
 
-    prompt_input_ids = [sequence.to(device) for sequence in _prepare_prompt_input_ids(draft_tokenizer, eval_prompts)]
+    prompt_input_ids = [
+        sequence.to(device) for sequence in _prepare_prompt_input_ids(draft_tokenizer, eval_prompts)
+    ]
     baseline_proxy = simulate_speculative_decoding(
         draft_model=draft_model,
         target_model=adapted_model,
@@ -334,6 +415,9 @@ def main() -> None:
         draft_tokenizer,
         eval_prompts,
         batch_size,
+        evaluation_contexts,
+        bootstrap_repetitions,
+        seed,
     )
 
     rows: list[dict[str, Any]] = []
@@ -341,34 +425,41 @@ def main() -> None:
     empirical_acceptances: list[float] = []
     for rank in rank_values:
         if rank == 0:
-            correction = MeanShiftCorrection().calibrate(
-                base_model,
-                adapted_model,
-                calibration_prompts,
-                tokenizer=tokenizer,
+            correction = MeanShiftCorrection().calibrate_from_dataset(
+                calibration_dataset,
             )
             spectral_tail_error = _mean_shift_error(calibration_dataset)
             reconstruction_error = _mean_shift_error(calibration_dataset)
             retained_energy_fraction = 0.0
         else:
-            correction = LowRankCorrection(rank=rank).calibrate(
-                base_model,
-                adapted_model,
-                calibration_prompts,
-                tokenizer=tokenizer,
+            correction = LowRankCorrection(rank=rank).calibrate_from_dataset(
+                calibration_dataset,
+                calibration_feature_logits,
             )
             approximation = correction.approximation_error()
             spectral_tail_error = approximation.spectral_tail_relative_frobenius
             reconstruction_error = approximation.centered_shift_reconstruction_relative_frobenius
             operator_calibration_error = approximation.operator_calibration_relative_frobenius
+            end_to_end_calibration_error = approximation.end_to_end_calibration_relative_frobenius
             coefficient_regression_error = approximation.coefficient_regression_relative_frobenius
             centered_operator_error = approximation.centered_operator_relative_frobenius
             retained_energy_fraction = approximation.retained_energy_fraction
         if rank == 0:
             operator_calibration_error = float("nan")
+            end_to_end_calibration_error = float("nan")
             coefficient_regression_error = float("nan")
             centered_operator_error = float("nan")
-        divergence = _evaluate_divergence(correction, draft_model, adapted_model, draft_tokenizer, eval_prompts, batch_size)
+        divergence = _evaluate_divergence(
+            correction,
+            draft_model,
+            adapted_model,
+            draft_tokenizer,
+            eval_prompts,
+            batch_size,
+            evaluation_contexts,
+            bootstrap_repetitions,
+            seed + rank * 10,
+        )
         proxy = simulate_speculative_decoding(
             draft_model=draft_model,
             target_model=adapted_model,
@@ -378,17 +469,33 @@ def main() -> None:
             eos_token_id=draft_tokenizer.eos_token_id,
             correction=correction,
         )
-        mean_residual_spans.append(float(divergence["mean_residual_logit_span"]))
-        empirical_acceptances.append(float(divergence["expected_rejection_sampling_acceptance"]))
+        bootstrap_summary = divergence["prompt_cluster_bootstrap"]
+        mean_residual_spans.append(float(bootstrap_summary["residual_logit_span"]["estimate"]))
+        empirical_acceptances.append(
+            float(bootstrap_summary["rejection_sampling_acceptance"]["estimate"])
+        )
         rows.append(
             {
                 "rank": rank,
                 "spectral_tail_relative_frobenius": spectral_tail_error,
                 "centered_shift_reconstruction_relative_frobenius": reconstruction_error,
                 "operator_calibration_relative_frobenius": operator_calibration_error,
+                "end_to_end_calibration_relative_frobenius": end_to_end_calibration_error,
                 "coefficient_regression_relative_frobenius": coefficient_regression_error,
                 "centered_operator_relative_frobenius": centered_operator_error,
-                "heldout_normalized_logit_error": float(divergence["heldout_normalized_logit_error"]),
+                "base_feature_coefficient_relative_frobenius": (
+                    approximation.base_feature_coefficient_relative_frobenius
+                    if rank > 0
+                    else float("nan")
+                ),
+                "base_feature_operator_relative_frobenius": (
+                    approximation.base_feature_operator_relative_frobenius
+                    if rank > 0
+                    else float("nan")
+                ),
+                "heldout_normalized_logit_error": float(
+                    divergence["heldout_normalized_logit_error"]
+                ),
                 "retained_energy_fraction": retained_energy_fraction,
                 "kl_divergence": divergence["kl_divergence"],
                 "mean_total_variation": divergence["mean_total_variation"],
@@ -398,15 +505,23 @@ def main() -> None:
                 "logit_acceptance_lower_bound": divergence["logit_acceptance_lower_bound"],
                 "logit_tv_upper_bound": divergence["logit_tv_upper_bound"],
                 "mean_residual_logit_span": divergence["mean_residual_logit_span"],
+                "num_prompt_clusters": divergence["num_prompt_clusters"],
+                "prompt_cluster_bootstrap": divergence["prompt_cluster_bootstrap"],
                 "greedy_proxy_acceptance_rate": proxy.acceptance.overall_acceptance_rate,
                 "acceptance_by_depth": proxy.acceptance.acceptance_by_depth,
+                "depth_attempts": proxy.acceptance.depth_attempts,
+                "depth_accepted": proxy.acceptance.depth_accepted,
                 "tokens_per_target_call": proxy.tokens_per_target_call,
             }
         )
 
     comparison = empirical_vs_predicted_recovery(
         approximation_error=mean_residual_spans,
-        base_acceptance=float(baseline_divergence["expected_rejection_sampling_acceptance"]),
+        base_acceptance=float(
+            baseline_divergence["prompt_cluster_bootstrap"]["rejection_sampling_acceptance"][
+                "estimate"
+            ]
+        ),
         empirical_acceptance=empirical_acceptances,
         error_metric="logit_span",
     )
@@ -417,6 +532,7 @@ def main() -> None:
         "baseline_expected_rejection_sampling_acceptance": baseline_divergence[
             "expected_rejection_sampling_acceptance"
         ],
+        "baseline_prompt_cluster_bootstrap": baseline_divergence["prompt_cluster_bootstrap"],
         "baseline_greedy_proxy_acceptance": baseline_proxy.acceptance.overall_acceptance_rate,
         "correction_calibration_shift": "adapted_target_minus_base_target",
         "logit_gauge": "row_mean_centered",
@@ -457,7 +573,13 @@ def main() -> None:
             "batch_size": batch_size,
             "speculation_length": speculation_length,
             "max_new_tokens": max_new_tokens,
+            "continuation_tokens": continuation_tokens,
+            "bootstrap_repetitions": bootstrap_repetitions,
+            "trajectory_policy": evaluation_contexts.generation_policy,
+            "calibration_contexts_sha256": calibration_contexts.sha256(),
+            "evaluation_contexts_sha256": evaluation_contexts.sha256(),
             "torch_dtype": torch_dtype_name,
+            "seed": seed,
         },
         cwd=Path.cwd(),
     )

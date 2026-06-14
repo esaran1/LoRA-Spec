@@ -40,16 +40,16 @@ if [[ -z "${ADAPTER_PATH:-}" ]]; then
   exit 1
 fi
 
-python scripts/validate_hypothesis.py \
+python scripts/measure_logit_shift_rank.py \
   --target-model meta-llama/Meta-Llama-3-70B-Instruct \
-  --draft-model meta-llama/Meta-Llama-3-8B-Instruct \
-  --tensor-parallel-degree 4 \
   --adapter-path "${ADAPTER_PATH}" \
   --adapter-rank "${RANK}" \
   --adapter-domain chat \
-  --adapter-epochs 3 \
-  --dataset tatsu-lab/alpaca \
-  --num-prompts 32 \
-  --speculation-length 4 \
-  --gpu-memory-utilization 0.85 \
+  --device-map auto \
+  --rank-estimation-mode projected \
+  --projection-dim 512 \
+  --projection-dimensions 128,256,512 \
+  --projection-repetitions 5 \
+  --batch-size 1 \
+  --prompts-file data/prompts/pilot_v1/calibration.jsonl \
   --verbose

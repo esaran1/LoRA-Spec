@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -18,6 +19,7 @@ from transformers import (
 )
 
 from .artifacts import tokenizers_are_equivalent
+from .theory import build_continuation_contexts, collect_context_model_outputs
 
 try:
     from huggingface_hub import snapshot_download
@@ -45,6 +47,8 @@ class CalibrationDivergence:
     num_positions: int
     per_prompt_kl: list[float]
     per_prompt_js: list[float]
+    continuation_contexts_sha256: str
+    generation_policy: str
 
 
 def _resolve_adapter_path(adapter_path: str | Path, revision: str | None = None) -> Path:
@@ -115,11 +119,65 @@ def _load_adapter_config(adapter_path: str | Path, revision: str | None = None) 
     resolved_path = _resolve_adapter_path(adapter_path, revision=revision)
     config_path = resolved_path / "adapter_config.json"
     if not config_path.exists():
-        raise FileNotFoundError(f"LoRA adapter config is required to compute effective BA scaling: {config_path}")
+        raise FileNotFoundError(
+            f"LoRA adapter config is required to compute effective BA scaling: {config_path}"
+        )
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Adapter config must contain a JSON object: {config_path}")
     return payload
+
+
+def validate_plain_lora_config(
+    adapter_config: Mapping[str, Any],
+    context: str = "adapter analysis",
+) -> None:
+    """Reject PEFT variants whose update is not exactly a scaled ``BA`` product."""
+    peft_type = str(adapter_config.get("peft_type", "LORA")).upper().split(".")[-1]
+    unsupported: list[str] = []
+    if peft_type != "LORA":
+        unsupported.append(f"peft_type={peft_type}")
+    if bool(adapter_config.get("use_dora", False)):
+        unsupported.append("use_dora=True")
+    bias = str(adapter_config.get("bias", "none")).lower()
+    if bias != "none":
+        unsupported.append(f"bias={bias}")
+    if adapter_config.get("modules_to_save"):
+        unsupported.append("modules_to_save")
+    if unsupported:
+        raise ValueError(f"{context} supports plain LoRA only; found {', '.join(unsupported)}")
+
+
+def validate_plain_lora_model(model: torch.nn.Module, context: str) -> None:
+    peft_configs = getattr(model, "peft_config", None)
+    if not isinstance(peft_configs, Mapping) or not peft_configs:
+        raise ValueError(f"{context} requires a loaded PEFT LoRA adapter")
+    for adapter_name, config in peft_configs.items():
+        validate_plain_lora_config(
+            {
+                "peft_type": getattr(config, "peft_type", "LORA"),
+                "use_dora": getattr(config, "use_dora", False),
+                "bias": getattr(config, "bias", "none"),
+                "modules_to_save": getattr(config, "modules_to_save", None),
+            },
+            context=f"{context} ({adapter_name})",
+        )
+
+
+def scale_plain_lora_adapter(model: torch.nn.Module, scale: float, context: str) -> None:
+    if scale < 0.0:
+        raise ValueError("LoRA magnitude scale must be non-negative")
+    validate_plain_lora_model(model, context=context)
+    if scale == 1.0:
+        return
+    scaled = 0
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if "lora_B" in name:
+                parameter.mul_(scale)
+                scaled += 1
+    if scaled == 0:
+        raise ValueError(f"{context} found no lora_B parameters")
 
 
 def _pattern_value(pattern: Any, layer_name: str, default: float) -> float:
@@ -139,10 +197,20 @@ def _pattern_value(pattern: Any, layer_name: str, default: float) -> float:
     return float(value)
 
 
-def _layer_lora_scaling(adapter_config: dict[str, Any], layer_name: str, matrix_a: torch.Tensor) -> float:
+def _layer_lora_scaling(
+    adapter_config: dict[str, Any], layer_name: str, matrix_a: torch.Tensor
+) -> float:
     inferred_rank = int(matrix_a.shape[0])
-    rank = _pattern_value(adapter_config.get("rank_pattern"), layer_name, float(adapter_config.get("r", inferred_rank)))
-    alpha = _pattern_value(adapter_config.get("alpha_pattern"), layer_name, float(adapter_config.get("lora_alpha", rank)))
+    rank = _pattern_value(
+        adapter_config.get("rank_pattern"),
+        layer_name,
+        float(adapter_config.get("r", inferred_rank)),
+    )
+    alpha = _pattern_value(
+        adapter_config.get("alpha_pattern"),
+        layer_name,
+        float(adapter_config.get("lora_alpha", rank)),
+    )
     if rank <= 0:
         raise ValueError(f"Invalid LoRA rank for {layer_name}: {rank}")
     denominator = rank**0.5 if bool(adapter_config.get("use_rslora", False)) else rank
@@ -192,6 +260,7 @@ def compute_adapter_properties(
 ) -> AdapterProperties:
     matrices = load_lora_matrices(adapter_path, revision=revision)
     adapter_config = _load_adapter_config(adapter_path, revision=revision)
+    validate_plain_lora_config(adapter_config, context="adapter-property computation")
     layer_frobenius_norms: dict[str, float] = {}
     layer_spectral_norms: dict[str, float] = {}
     layer_weight_norm_distribution: dict[str, float] = {}
@@ -213,9 +282,7 @@ def compute_adapter_properties(
 
     base_parameter_count = _infer_base_parameter_count(base_model)
     fraction = (
-        adapted_parameter_count / base_parameter_count
-        if base_parameter_count > 0
-        else float("nan")
+        adapted_parameter_count / base_parameter_count if base_parameter_count > 0 else float("nan")
     )
     return AdapterProperties(
         frobenius_norm_sum=float(sum(layer_frobenius_norms.values())),
@@ -264,38 +331,6 @@ def _prompt_batches(prompts: Iterable[str], batch_size: int) -> Iterable[list[st
         yield batch
 
 
-def _per_prompt_token_divergence(
-    base_logits: torch.Tensor,
-    adapted_logits: torch.Tensor,
-    attention_mask: torch.Tensor,
-) -> tuple[list[float], list[float], int]:
-    base_log_probs = F.log_softmax(base_logits[:, :-1, :], dim=-1)
-    adapted_log_probs = F.log_softmax(adapted_logits[:, :-1, :], dim=-1)
-    base_probs = base_log_probs.exp()
-    adapted_probs = adapted_log_probs.exp()
-
-    mask = attention_mask[:, 1:].bool()
-    kl = torch.sum(adapted_probs * (adapted_log_probs - base_log_probs), dim=-1)
-    midpoint = 0.5 * (adapted_probs + base_probs)
-    midpoint_log = torch.log(midpoint.clamp_min(1e-12))
-    js_left = torch.sum(adapted_probs * (adapted_log_probs - midpoint_log), dim=-1)
-    js_right = torch.sum(base_probs * (base_log_probs - midpoint_log), dim=-1)
-    js = 0.5 * (js_left + js_right)
-
-    per_prompt_kl: list[float] = []
-    per_prompt_js: list[float] = []
-    total_positions = 0
-    for batch_index in range(mask.shape[0]):
-        prompt_mask = mask[batch_index]
-        positions = int(prompt_mask.sum().item())
-        if positions == 0:
-            continue
-        total_positions += positions
-        per_prompt_kl.append(float(kl[batch_index].masked_select(prompt_mask).mean().item()))
-        per_prompt_js.append(float(js[batch_index].masked_select(prompt_mask).mean().item()))
-    return per_prompt_kl, per_prompt_js, total_positions
-
-
 @torch.inference_mode()
 def compute_distribution_divergence(
     base_model: str | PreTrainedModel,
@@ -305,6 +340,7 @@ def compute_distribution_divergence(
     adapted_tokenizer: PreTrainedTokenizerBase | None = None,
     batch_size: int = 2,
     device: str | torch.device | None = None,
+    continuation_tokens: int = 16,
 ) -> CalibrationDivergence:
     base, base_tokenizer = _resolve_model(base_model, tokenizer=tokenizer, device=device)
     adapted, adapted_tokenizer = _resolve_model(
@@ -317,46 +353,55 @@ def compute_distribution_divergence(
             "Base and adapted tokenizers must be exactly equivalent for KL/JSD comparison"
         )
 
-    per_prompt_kl: list[float] = []
-    per_prompt_js: list[float] = []
-    total_positions = 0
-    weighted_kl_sum = 0.0
-    weighted_js_sum = 0.0
-
-    for batch_prompts in _prompt_batches(prompts, batch_size):
-        encoded = base_tokenizer(
-            batch_prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
+    contexts = build_continuation_contexts(
+        base,
+        base_tokenizer,
+        prompts,
+        max_new_tokens=continuation_tokens,
+    )
+    base_logits, _, prompt_indices, _ = collect_context_model_outputs(
+        base,
+        base_tokenizer,
+        contexts,
+        batch_size=batch_size,
+    )
+    adapted_logits, _, adapted_prompt_indices, _ = collect_context_model_outputs(
+        adapted,
+        adapted_tokenizer,
+        contexts,
+        batch_size=batch_size,
+    )
+    if prompt_indices != adapted_prompt_indices:
+        raise RuntimeError("Base and adapted divergence contexts are not aligned")
+    base_log_probs = F.log_softmax(base_logits, dim=-1)
+    adapted_log_probs = F.log_softmax(adapted_logits, dim=-1)
+    base_probs = base_log_probs.exp()
+    adapted_probs = adapted_log_probs.exp()
+    kl = torch.sum(adapted_probs * (adapted_log_probs - base_log_probs), dim=-1)
+    midpoint = 0.5 * (adapted_probs + base_probs)
+    midpoint_log = torch.log(midpoint.clamp_min(1e-12))
+    js = 0.5 * (
+        torch.sum(adapted_probs * (adapted_log_probs - midpoint_log), dim=-1)
+        + torch.sum(base_probs * (base_log_probs - midpoint_log), dim=-1)
+    )
+    per_prompt_kl = []
+    per_prompt_js = []
+    for prompt_index in range(len(prompts)):
+        selected = torch.tensor(
+            [index == prompt_index for index in prompt_indices],
+            dtype=torch.bool,
         )
-        encoded = {key: value.to(next(base.parameters()).device) for key, value in encoded.items()}
-        base_outputs = base(**encoded)
-        adapted_outputs = adapted(**encoded)
-        batch_prompt_kl, batch_prompt_js, positions = _per_prompt_token_divergence(
-            base_outputs.logits.float(),
-            adapted_outputs.logits.float(),
-            encoded["attention_mask"],
-        )
-        total_positions += positions
-        per_prompt_kl.extend(batch_prompt_kl)
-        per_prompt_js.extend(batch_prompt_js)
-        prompt_positions = [
-            int(encoded["attention_mask"][index, 1:].sum().item())
-            for index in range(encoded["attention_mask"].shape[0])
-            if int(encoded["attention_mask"][index, 1:].sum().item()) > 0
-        ]
-        weighted_kl_sum += sum(value * prompt_count for value, prompt_count in zip(batch_prompt_kl, prompt_positions))
-        weighted_js_sum += sum(value * prompt_count for value, prompt_count in zip(batch_prompt_js, prompt_positions))
-
-    if not per_prompt_kl:
-        raise ValueError("Prompt set must not be empty")
+        per_prompt_kl.append(float(kl[selected].mean().item()))
+        per_prompt_js.append(float(js[selected].mean().item()))
+    total_positions = len(prompt_indices)
     return CalibrationDivergence(
-        kl_divergence=float(weighted_kl_sum / total_positions),
-        js_divergence=float(weighted_js_sum / total_positions),
+        kl_divergence=float(kl.mean().item()),
+        js_divergence=float(js.mean().item()),
         num_positions=total_positions,
         per_prompt_kl=per_prompt_kl,
         per_prompt_js=per_prompt_js,
+        continuation_contexts_sha256=contexts.sha256(),
+        generation_policy=contexts.generation_policy,
     )
 
 

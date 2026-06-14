@@ -37,8 +37,10 @@ def _directory_sha256(path: Path) -> str:
         raise ValueError(f"Local artifact directory contains no files: {path}")
     for candidate in files:
         relative = candidate.relative_to(path).as_posix().encode("utf-8")
+        size = candidate.stat().st_size
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)
+        digest.update(size.to_bytes(8, "big"))
         with candidate.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
@@ -68,9 +70,7 @@ def resolve_artifact_revision(
 
     if api is None:
         if HfApi is None:
-            raise ImportError(
-                "Remote artifact resolution requires the huggingface-hub package"
-            )
+            raise ImportError("Remote artifact resolution requires the huggingface-hub package")
         api = HfApi()
     client = api
     info = client.repo_info(
@@ -94,9 +94,7 @@ def materialize_artifact(provenance: ArtifactProvenance) -> str:
     if provenance.repository_type == "local":
         return str(source_path.resolve())
     if snapshot_download is None:
-        raise ImportError(
-            "Remote artifact materialization requires the huggingface-hub package"
-        )
+        raise ImportError("Remote artifact materialization requires the huggingface-hub package")
     return snapshot_download(
         repo_id=provenance.source,
         revision=provenance.resolved_revision,
