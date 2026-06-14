@@ -31,6 +31,10 @@ class LogitShiftDataset:
     vocabulary_size: int
     continuation_contexts: ContinuationContextSet
 
+    @property
+    def num_positions(self) -> int:
+        return int(self.shift_matrix.shape[0])
+
 
 @dataclass(frozen=True)
 class ContinuationContextSet:

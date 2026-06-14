@@ -8,6 +8,7 @@ pytest.importorskip("transformers")
 from transformers import PreTrainedModel, PretrainedConfig
 
 from lora_spec.correction import ContextDependentCorrection, LowRankCorrection, MeanShiftCorrection
+from lora_spec.theory import ContinuationContextSet
 
 
 class TinyConfig(PretrainedConfig):
@@ -108,6 +109,16 @@ class TinyLM(PreTrainedModel):
         return TinyOutput(logits=logits, hidden_states=hidden_states)
 
 
+def _all_token_contexts() -> ContinuationContextSet:
+    return ContinuationContextSet(
+        input_ids=(torch.tensor([0, 1, 2, 3, 0], dtype=torch.long),),
+        prompt_lengths=(1,),
+        continuation_lengths=(4,),
+        trajectory_model="synthetic_base_target",
+        generation_policy="fixed_test_contexts",
+    )
+
+
 def test_mean_shift_correction_recovers_constant_shift() -> None:
     tokenizer = TinyTokenizer()
     delta = torch.tensor(
@@ -121,7 +132,11 @@ def test_mean_shift_correction_recovers_constant_shift() -> None:
     base = TinyLM()
     adapted = TinyLM(shift_matrix=delta)
     correction = MeanShiftCorrection().calibrate(
-        base, adapted, ["0 1 2", "1 2 3"], tokenizer=tokenizer
+        base,
+        adapted,
+        ["0"],
+        tokenizer=tokenizer,
+        continuation_contexts=_all_token_contexts(),
     )
     adjusted = correction.apply(torch.zeros(1, tokenizer.vocab_size)).squeeze(0)
     assert adjusted.shape[0] == tokenizer.vocab_size
@@ -136,7 +151,11 @@ def test_low_rank_correction_recovers_structured_shift() -> None:
     base = TinyLM()
     adapted = TinyLM(shift_matrix=shift_matrix)
     correction = LowRankCorrection(rank=1).calibrate(
-        base, adapted, ["0 1 2 3", "1 2 3 0"], tokenizer=tokenizer
+        base,
+        adapted,
+        ["0"],
+        tokenizer=tokenizer,
+        continuation_contexts=_all_token_contexts(),
     )
     logits = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     adjusted = correction.apply(logits)
@@ -173,8 +192,9 @@ def test_context_dependent_correction_uses_hidden_state() -> None:
     ).calibrate(
         base,
         adapted,
-        ["0 1 2 3", "2 3 0 1"],
+        ["0"],
         tokenizer=tokenizer,
+        continuation_contexts=_all_token_contexts(),
     )
     hidden_state = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     adjusted = correction.apply(torch.zeros(1, tokenizer.vocab_size), hidden_state=hidden_state)

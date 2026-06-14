@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Research infrastructure for studying LoRA effects on speculative decoding."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "LoRA-Spec Authors" }]
 dependencies = [
   "numpy==1.26.4",

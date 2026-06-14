@@ -19,7 +19,11 @@ from transformers import (
 )
 
 from .artifacts import tokenizers_are_equivalent
-from .theory import build_continuation_contexts, collect_context_model_outputs
+from .theory import (
+    ContinuationContextSet,
+    build_continuation_contexts,
+    collect_context_model_outputs,
+)
 
 try:
     from huggingface_hub import snapshot_download
@@ -341,6 +345,7 @@ def compute_distribution_divergence(
     batch_size: int = 2,
     device: str | torch.device | None = None,
     continuation_tokens: int = 16,
+    continuation_contexts: ContinuationContextSet | None = None,
 ) -> CalibrationDivergence:
     base, base_tokenizer = _resolve_model(base_model, tokenizer=tokenizer, device=device)
     adapted, adapted_tokenizer = _resolve_model(
@@ -353,7 +358,7 @@ def compute_distribution_divergence(
             "Base and adapted tokenizers must be exactly equivalent for KL/JSD comparison"
         )
 
-    contexts = build_continuation_contexts(
+    contexts = continuation_contexts or build_continuation_contexts(
         base,
         base_tokenizer,
         prompts,

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
 from enum import Enum
+from pathlib import Path
 
+import json
 import pytest
 import torch
-import json
 
 pytest.importorskip("safetensors")
 pytest.importorskip("transformers")
@@ -21,6 +21,7 @@ from lora_spec.adapter_props import (
     load_lora_matrices,
     validate_plain_lora_config,
 )
+from lora_spec.theory import ContinuationContextSet
 
 
 class TinyConfig(PretrainedConfig):
@@ -123,12 +124,12 @@ def test_load_lora_matrices_and_compute_properties(tmp_path: Path) -> None:
 
     base_model = torch.nn.Linear(2, 2, bias=False)
     properties = compute_adapter_properties(adapter_dir, base_model=base_model)
-    assert properties.adapted_parameter_count == 10
-    assert properties.frobenius_norm_sum == pytest.approx(18.1421356237, rel=1e-5)
-    assert properties.max_spectral_norm == pytest.approx(10.0, rel=1e-5)
+    assert properties.adapted_parameter_count == 12
+    assert properties.frobenius_norm_sum == pytest.approx(19.7989898732, rel=1e-5)
+    assert properties.max_spectral_norm == pytest.approx(14.1421356237, rel=1e-5)
     assert properties.layer_frobenius_norms["layer0"] == pytest.approx(5.6568542495, rel=1e-5)
     assert properties.layer_scalings == {"layer0": 2.0, "layer1": 2.0}
-    assert properties.adapted_parameter_fraction == pytest.approx(2.5)
+    assert properties.adapted_parameter_fraction == pytest.approx(3.0)
 
 
 def test_compute_distribution_divergence_reports_true_per_prompt_values() -> None:
@@ -136,6 +137,17 @@ def test_compute_distribution_divergence_reports_true_per_prompt_values() -> Non
     base = TinyLM()
     adapted = TinyLM(delta=torch.tensor([0.3, -0.2, 0.1, -0.1]))
     prompts = ["0 1 2 3", "1 2", "2 3 0"]
+    contexts = ContinuationContextSet(
+        input_ids=(
+            torch.tensor([0, 1, 2]),
+            torch.tensor([1, 2, 3]),
+            torch.tensor([2, 3, 0]),
+        ),
+        prompt_lengths=(1, 1, 1),
+        continuation_lengths=(2, 2, 2),
+        trajectory_model="synthetic_base_target",
+        generation_policy="fixed_test_contexts",
+    )
 
     divergence = compute_distribution_divergence(
         base,
@@ -144,6 +156,7 @@ def test_compute_distribution_divergence_reports_true_per_prompt_values() -> Non
         tokenizer=tokenizer,
         adapted_tokenizer=tokenizer,
         batch_size=2,
+        continuation_contexts=contexts,
     )
 
     assert len(divergence.per_prompt_kl) == len(prompts)
