@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import _bootstrap  # noqa: F401
 import argparse
 
 from lora_spec.prompts import verify_prompt_manifest

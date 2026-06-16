@@ -8,7 +8,7 @@ pytest.importorskip("transformers")
 from transformers import PreTrainedModel, PretrainedConfig
 
 from lora_spec.correction import ContextDependentCorrection, LowRankCorrection, MeanShiftCorrection
-from lora_spec.theory import ContinuationContextSet
+from lora_spec.theory import ContinuationContextSet, LogitShiftDataset
 
 
 class TinyConfig(PretrainedConfig):
@@ -119,6 +119,20 @@ def _all_token_contexts() -> ContinuationContextSet:
     )
 
 
+def _shift_dataset(shift_matrix: torch.Tensor) -> LogitShiftDataset:
+    base_logits = torch.zeros_like(shift_matrix)
+    return LogitShiftDataset(
+        shift_matrix=shift_matrix.float(),
+        base_logits_matrix=base_logits,
+        adapted_logits_matrix=shift_matrix.float(),
+        hidden_state_matrix=None,
+        prompt_indices=[0] * shift_matrix.shape[0],
+        token_positions=list(range(shift_matrix.shape[0])),
+        vocabulary_size=int(shift_matrix.shape[1]),
+        continuation_contexts=_all_token_contexts(),
+    )
+
+
 def test_mean_shift_correction_recovers_constant_shift() -> None:
     tokenizer = TinyTokenizer()
     delta = torch.tensor(
@@ -200,3 +214,40 @@ def test_context_dependent_correction_uses_hidden_state() -> None:
     adjusted = correction.apply(torch.zeros(1, tokenizer.vocab_size), hidden_state=hidden_state)
     expected = shift_matrix[0].view(1, -1)
     assert torch.linalg.norm(adjusted - expected) < 0.25
+
+
+def test_context_dependent_recalibration_clears_cached_tensors() -> None:
+    feature_matrix = torch.eye(4)
+    alternating_shift = torch.tensor(
+        [
+            [0.4, -0.4, 0.0, 0.0],
+            [-0.4, 0.4, 0.0, 0.0],
+            [0.4, -0.4, 0.0, 0.0],
+            [-0.4, 0.4, 0.0, 0.0],
+        ],
+    )
+    mean_offset = torch.tensor([0.0, 0.0, 1.5, -1.5])
+    correction = ContextDependentCorrection(
+        rank=1,
+        hidden_dim=4,
+        epochs=0,
+        lr=1e-2,
+        seed=11,
+    )
+    correction.calibrate_from_dataset(_shift_dataset(alternating_shift), feature_matrix)
+    first = correction.apply(
+        torch.zeros(1, 4),
+        hidden_state=feature_matrix[:1],
+    )
+
+    correction.calibrate_from_dataset(
+        _shift_dataset(alternating_shift + mean_offset),
+        feature_matrix,
+    )
+    second = correction.apply(
+        torch.zeros(1, 4),
+        hidden_state=feature_matrix[:1],
+    )
+
+    observed_offset = second - first
+    assert torch.allclose(observed_offset, mean_offset.view(1, -1), atol=1e-6)

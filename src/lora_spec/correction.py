@@ -595,6 +595,7 @@ class ContextDependentCorrection(_BaseCorrection):
             loss.backward()
             optimizer.step()
         self.network = network.eval().to(source_device)
+        self._tensor_cache.clear()
         return self
 
     def apply(
