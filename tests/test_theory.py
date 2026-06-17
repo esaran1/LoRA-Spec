@@ -7,6 +7,7 @@ import lora_spec.theory as theory_module
 from lora_spec.theory import (
     ContinuationContextSet,
     FactoredParameterDelta,
+    LogitShiftDataset,
     center_logit_shift_rows,
     collect_context_model_outputs,
     effective_rank,
@@ -19,6 +20,7 @@ from lora_spec.theory import (
     subspace_overlap,
     subspace_overlap_from_bases,
     truncated_right_singular_subspace,
+    validate_continuation_contexts_for_prompts,
 )
 
 
@@ -57,6 +59,45 @@ def test_continuation_context_rejects_inconsistent_lengths() -> None:
             continuation_lengths=(2,),
             trajectory_model="test",
             generation_policy="fixed",
+        )
+
+
+def test_explicit_contexts_must_match_prompt_count() -> None:
+    contexts = ContinuationContextSet(
+        input_ids=(torch.tensor([1, 2, 3], dtype=torch.long),),
+        prompt_lengths=(2,),
+        continuation_lengths=(1,),
+        trajectory_model="test",
+        generation_policy="fixed",
+    )
+
+    with pytest.raises(ValueError, match="1 continuation trajectories for 2 prompts"):
+        validate_continuation_contexts_for_prompts(
+            contexts,
+            ["prompt a", "prompt b"],
+            context="unit_test",
+        )
+
+
+def test_logit_shift_dataset_rejects_misaligned_shapes() -> None:
+    contexts = ContinuationContextSet(
+        input_ids=(torch.tensor([1, 2, 3], dtype=torch.long),),
+        prompt_lengths=(2,),
+        continuation_lengths=(1,),
+        trajectory_model="test",
+        generation_policy="fixed",
+    )
+
+    with pytest.raises(ValueError, match="base_logits_matrix must match"):
+        LogitShiftDataset(
+            shift_matrix=torch.zeros(1, 3),
+            base_logits_matrix=torch.zeros(1, 4),
+            adapted_logits_matrix=torch.zeros(1, 3),
+            hidden_state_matrix=None,
+            prompt_indices=[0],
+            token_positions=[1],
+            vocabulary_size=3,
+            continuation_contexts=contexts,
         )
 
 

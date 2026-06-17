@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from lora_spec.predictive import (
     LinearRegressionModel,
@@ -14,6 +15,14 @@ from lora_spec.predictive import (
 
 def test_r_squared_score_is_one_for_perfect_predictions() -> None:
     assert r_squared_score([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]) == 1.0
+
+
+def test_r_squared_rejects_misaligned_or_nonfinite_inputs() -> None:
+    with pytest.raises(ValueError, match="same number of values"):
+        r_squared_score([1.0, 2.0], [1.0])
+
+    with pytest.raises(ValueError, match="finite"):
+        r_squared_score([1.0, float("inf")], [1.0, 2.0])
 
 
 def test_linear_and_multivariate_regression_fit_simple_relation() -> None:
@@ -59,3 +68,19 @@ def test_leave_one_group_out_keeps_related_rows_in_same_fold() -> None:
     )
 
     assert len(result.predictions) == 4
+
+
+def test_cross_validation_rejects_too_few_or_nonfinite_rows() -> None:
+    with pytest.raises(ValueError, match="at least 2 observations"):
+        leave_one_out_cv(lambda: MultivariateRegressionModel(), [[1.0]], [1.0])
+
+    with pytest.raises(ValueError, match="finite"):
+        leave_one_out_cv(lambda: MultivariateRegressionModel(), [[1.0], [float("nan")]], [1.0, 2.0])
+
+
+def test_regression_rejects_misaligned_targets_and_bad_feature_index() -> None:
+    with pytest.raises(ValueError, match="same number of rows"):
+        MultivariateRegressionModel().fit([[1.0], [2.0]], [1.0])
+
+    with pytest.raises(ValueError, match="feature_index"):
+        LinearRegressionModel(feature_index=3).fit([[1.0], [2.0]], [1.0, 2.0])

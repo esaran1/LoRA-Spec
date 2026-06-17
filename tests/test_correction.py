@@ -251,3 +251,33 @@ def test_context_dependent_recalibration_clears_cached_tensors() -> None:
 
     observed_offset = second - first
     assert torch.allclose(observed_offset, mean_offset.view(1, -1), atol=1e-6)
+
+
+def test_context_dependent_uses_population_feature_std_with_variance_floor() -> None:
+    shift = torch.tensor(
+        [
+            [0.4, -0.4, 0.0, 0.0],
+            [-0.4, 0.4, 0.0, 0.0],
+            [0.4, -0.4, 0.0, 0.0],
+            [-0.4, 0.4, 0.0, 0.0],
+        ],
+    )
+    features = torch.tensor(
+        [
+            [0.0, 3.0],
+            [2.0, 3.0],
+            [4.0, 3.0],
+            [6.0, 3.0],
+        ],
+    )
+    correction = ContextDependentCorrection(
+        rank=1,
+        hidden_dim=4,
+        epochs=0,
+        lr=1e-2,
+        seed=13,
+    ).calibrate_from_dataset(_shift_dataset(shift), features)
+
+    assert correction.feature_std is not None
+    assert torch.allclose(correction.feature_std[0, 0], features.std(dim=0, unbiased=False)[0])
+    assert correction.feature_std[0, 1] == pytest.approx(1e-6)

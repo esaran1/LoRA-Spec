@@ -23,6 +23,7 @@ from .theory import (
     ContinuationContextSet,
     build_continuation_contexts,
     collect_context_model_outputs,
+    validate_continuation_contexts_for_prompts,
 )
 
 try:
@@ -363,6 +364,11 @@ def compute_distribution_divergence(
         base_tokenizer,
         prompts,
         max_new_tokens=continuation_tokens,
+    )
+    validate_continuation_contexts_for_prompts(
+        contexts,
+        prompts,
+        context="compute_distribution_divergence",
     )
     base_logits, _, prompt_indices, _ = collect_context_model_outputs(
         base,

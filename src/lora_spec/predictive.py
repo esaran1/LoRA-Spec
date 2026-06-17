@@ -21,8 +21,14 @@ class RegressionMetrics:
 
 
 def r_squared_score(targets: ArrayLike, predictions: ArrayLike) -> float:
-    y_true = np.asarray(targets, dtype=np.float64)
-    y_pred = np.asarray(predictions, dtype=np.float64)
+    y_true = np.asarray(targets, dtype=np.float64).reshape(-1)
+    y_pred = np.asarray(predictions, dtype=np.float64).reshape(-1)
+    if y_true.shape != y_pred.shape:
+        raise ValueError("targets and predictions must contain the same number of values")
+    if y_true.size == 0:
+        raise ValueError("targets and predictions must not be empty")
+    if not np.isfinite(y_true).all() or not np.isfinite(y_pred).all():
+        raise ValueError("targets and predictions must be finite")
     ss_res = float(np.sum((y_true - y_pred) ** 2))
     ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
     if ss_tot == 0.0:
@@ -35,10 +41,32 @@ class Regressor(Protocol):
     predict: Callable[[ArrayLike], np.ndarray]
 
 
+def _validated_arrays(
+    features: ArrayLike,
+    targets: ArrayLike,
+    min_samples: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(features, dtype=np.float64)
+    y = np.asarray(targets, dtype=np.float64).reshape(-1)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    if x.ndim != 2:
+        raise ValueError("features must be one- or two-dimensional")
+    if x.shape[0] != y.shape[0]:
+        raise ValueError("features and targets must contain the same number of rows")
+    if y.shape[0] < min_samples:
+        raise ValueError(f"at least {min_samples} observations are required")
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise ValueError("features and targets must be finite")
+    return x, y
+
+
 class _EvaluationMixin:
     def evaluate(self, features: ArrayLike, targets: ArrayLike) -> RegressionMetrics:
         predictions = self.predict(features)
-        y_true = np.asarray(targets, dtype=np.float64).reshape(-1)
+        _, y_true = _validated_arrays(features, targets)
+        if predictions.reshape(-1).shape[0] != y_true.shape[0]:
+            raise ValueError("predictions and targets must contain the same number of rows")
         mse = float(np.mean((predictions.reshape(-1) - y_true) ** 2))
         return RegressionMetrics(
             r_squared=r_squared_score(y_true, predictions),
@@ -54,10 +82,10 @@ class LinearRegressionModel(_EvaluationMixin):
         self.coefficients: np.ndarray | None = None
 
     def fit(self, features: ArrayLike, targets: ArrayLike) -> "LinearRegressionModel":
-        x = np.asarray(features, dtype=np.float64)
-        y = np.asarray(targets, dtype=np.float64).reshape(-1, 1)
-        if x.ndim == 1:
-            x = x.reshape(-1, 1)
+        x, y_vector = _validated_arrays(features, targets)
+        y = y_vector.reshape(-1, 1)
+        if self.feature_index < 0 or self.feature_index >= x.shape[1]:
+            raise ValueError("feature_index is out of range")
         column = x[:, [self.feature_index]]
         design = np.concatenate([np.ones((column.shape[0], 1)), column], axis=1)
         self.coefficients = np.linalg.pinv(design) @ y
@@ -82,10 +110,10 @@ class MultivariateRegressionModel(_EvaluationMixin):
         self.feature_std: np.ndarray | None = None
 
     def fit(self, features: ArrayLike, targets: ArrayLike) -> "MultivariateRegressionModel":
-        x = np.asarray(features, dtype=np.float64)
-        y = np.asarray(targets, dtype=np.float64).reshape(-1, 1)
-        if x.ndim == 1:
-            x = x.reshape(-1, 1)
+        if self.ridge < 0.0:
+            raise ValueError("ridge must be non-negative")
+        x, y_vector = _validated_arrays(features, targets)
+        y = y_vector.reshape(-1, 1)
         self.feature_mean = x.mean(axis=0, keepdims=True)
         self.feature_std = x.std(axis=0, keepdims=True)
         self.feature_std[self.feature_std < 1e-12] = 1.0
@@ -124,10 +152,11 @@ class MLPRegressionModel(_EvaluationMixin):
         self.feature_std: np.ndarray | None = None
 
     def fit(self, features: ArrayLike, targets: ArrayLike) -> "MLPRegressionModel":
-        x = np.asarray(features, dtype=np.float32)
-        y = np.asarray(targets, dtype=np.float32).reshape(-1, 1)
-        if x.ndim == 1:
-            x = x.reshape(-1, 1)
+        if self.hidden_dim < 1 or self.epochs < 1 or self.lr <= 0.0:
+            raise ValueError("hidden_dim, epochs, and lr must be positive")
+        x64, y64 = _validated_arrays(features, targets)
+        x = x64.astype(np.float32)
+        y = y64.astype(np.float32).reshape(-1, 1)
 
         self.feature_mean = x.mean(axis=0, keepdims=True)
         self.feature_std = x.std(axis=0, keepdims=True) + 1e-6
@@ -175,10 +204,7 @@ def leave_one_out_cv(
     features: ArrayLike,
     targets: ArrayLike,
 ) -> RegressionMetrics:
-    x = np.asarray(features, dtype=np.float64)
-    y = np.asarray(targets, dtype=np.float64).reshape(-1)
-    if x.ndim == 1:
-        x = x.reshape(-1, 1)
+    x, y = _validated_arrays(features, targets, min_samples=2)
     predictions = np.zeros_like(y)
     for index in range(len(y)):
         train_mask = np.ones(len(y), dtype=bool)
@@ -200,11 +226,8 @@ def leave_one_group_out_cv(
     targets: ArrayLike,
     groups: list[str] | np.ndarray,
 ) -> RegressionMetrics:
-    x = np.asarray(features, dtype=np.float64)
-    y = np.asarray(targets, dtype=np.float64).reshape(-1)
+    x, y = _validated_arrays(features, targets, min_samples=2)
     group_values = np.asarray(groups, dtype=str).reshape(-1)
-    if x.ndim == 1:
-        x = x.reshape(-1, 1)
     if len(y) != len(group_values):
         raise ValueError("groups must contain exactly one value per target")
     unique_groups = np.unique(group_values)

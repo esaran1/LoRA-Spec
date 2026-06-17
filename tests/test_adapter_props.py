@@ -166,6 +166,27 @@ def test_compute_distribution_divergence_reports_true_per_prompt_values() -> Non
     assert divergence.js_divergence > 0.0
 
 
+def test_distribution_divergence_rejects_mismatched_explicit_contexts() -> None:
+    tokenizer = TinyTokenizer()
+    contexts = ContinuationContextSet(
+        input_ids=(torch.tensor([0, 1, 2]),),
+        prompt_lengths=(1,),
+        continuation_lengths=(2,),
+        trajectory_model="synthetic_base_target",
+        generation_policy="fixed_test_contexts",
+    )
+
+    with pytest.raises(ValueError, match="1 continuation trajectories for 2 prompts"):
+        compute_distribution_divergence(
+            TinyLM(),
+            TinyLM(delta=torch.tensor([0.1, 0.0, 0.0, -0.1])),
+            ["0 1", "1 2"],
+            tokenizer=tokenizer,
+            adapted_tokenizer=tokenizer,
+            continuation_contexts=contexts,
+        )
+
+
 @pytest.mark.parametrize(
     "config, marker",
     [

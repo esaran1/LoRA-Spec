@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -14,4 +15,14 @@ def add_source_checkout_to_path() -> None:
         sys.path.insert(0, source_entry)
 
 
+def configure_headless_matplotlib() -> None:
+    import os
+
+    cache_path = Path(tempfile.gettempdir()) / "lora-spec-matplotlib-cache"
+    cache_path.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLBACKEND", "Agg")
+    os.environ.setdefault("MPLCONFIGDIR", str(cache_path))
+
+
 add_source_checkout_to_path()
+configure_headless_matplotlib()

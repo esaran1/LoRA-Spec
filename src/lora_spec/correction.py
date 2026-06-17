@@ -574,7 +574,7 @@ class ContextDependentCorrection(_BaseCorrection):
         features = feature_matrix.float()
         self.hidden_size = features.shape[1]
         self.feature_mean = features.mean(dim=0, keepdim=True)
-        self.feature_std = features.std(dim=0, keepdim=True).clamp_min(1e-6)
+        self.feature_std = features.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
         normalized = ((features - self.feature_mean) / self.feature_std).to(source_device)
         targets = targets.to(source_device)
 

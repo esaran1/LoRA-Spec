@@ -352,6 +352,8 @@ def aggregate_speculative_metrics(
 
     total_drafted = sum(item.acceptance.total_drafted_tokens for item in metrics)
     total_accepted = sum(item.acceptance.accepted_drafted_tokens for item in metrics)
+    total_generated_tokens = sum(item.timing.total_generated_tokens for item in metrics)
+    total_wall_time_s = sum(item.timing.wall_time_s for item in metrics)
     ttft_values = [item.timing.ttft_ms for item in metrics if math.isfinite(item.timing.ttft_ms)]
     backends = sorted({item.instrumentation_backend for item in metrics})
     return SpeculativeDecodingMetrics(
@@ -375,10 +377,14 @@ def aggregate_speculative_metrics(
             speculative_steps=sum(item.acceptance.speculative_steps for item in metrics),
         ),
         timing=TimingMetrics(
-            throughput_tps=sum(item.timing.throughput_tps for item in metrics) / len(metrics),
+            throughput_tps=(
+                float(total_generated_tokens / total_wall_time_s)
+                if total_wall_time_s > 0.0
+                else 0.0
+            ),
             ttft_ms=sum(ttft_values) / len(ttft_values) if ttft_values else float("nan"),
-            total_generated_tokens=sum(item.timing.total_generated_tokens for item in metrics),
-            wall_time_s=sum(item.timing.wall_time_s for item in metrics),
+            total_generated_tokens=total_generated_tokens,
+            wall_time_s=total_wall_time_s,
         ),
         instrumentation_backend=",".join(backends),
         raw_decisions=[decision for item in metrics for decision in item.raw_decisions],

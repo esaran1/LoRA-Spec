@@ -331,18 +331,32 @@ def test_aggregate_speculative_metrics_weights_each_depth_by_eligible_steps() ->
     short.record([True])
     short.record([False])
 
-    def measured(accumulator: AcceptanceAccumulator) -> SpeculativeDecodingMetrics:
+    def measured(
+        accumulator: AcceptanceAccumulator,
+        generated_tokens: int,
+        wall_time_s: float,
+    ) -> SpeculativeDecodingMetrics:
         return SpeculativeDecodingMetrics(
             acceptance=accumulator.summarize(),
-            timing=TimingMetrics(1.0, 1.0, 1, 1.0),
+            timing=TimingMetrics(
+                throughput_tps=float(generated_tokens / wall_time_s),
+                ttft_ms=1.0,
+                total_generated_tokens=generated_tokens,
+                wall_time_s=wall_time_s,
+            ),
             instrumentation_backend="test",
         )
 
-    aggregate = aggregate_speculative_metrics([measured(long), measured(short)])
+    aggregate = aggregate_speculative_metrics(
+        [measured(long, generated_tokens=100, wall_time_s=10.0), measured(short, 1, 1.0)]
+    )
 
     assert aggregate.acceptance.depth_attempts == [3, 1, 1]
     assert aggregate.acceptance.depth_accepted == [2, 1, 1]
     assert aggregate.acceptance.acceptance_by_depth == pytest.approx([2 / 3, 1.0, 1.0])
+    assert aggregate.timing.total_generated_tokens == 101
+    assert aggregate.timing.wall_time_s == pytest.approx(11.0)
+    assert aggregate.timing.throughput_tps == pytest.approx(101 / 11)
 
 
 def test_simulate_speculative_decoding_tracks_acceptance_and_bonus_tokens() -> None:

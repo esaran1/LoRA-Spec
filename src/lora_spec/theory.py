@@ -31,6 +31,30 @@ class LogitShiftDataset:
     vocabulary_size: int
     continuation_contexts: ContinuationContextSet
 
+    def __post_init__(self) -> None:
+        if self.shift_matrix.ndim != 2:
+            raise ValueError("shift_matrix must be a 2D tensor")
+        expected_shape = tuple(self.shift_matrix.shape)
+        if tuple(self.base_logits_matrix.shape) != expected_shape:
+            raise ValueError("base_logits_matrix must match shift_matrix shape")
+        if tuple(self.adapted_logits_matrix.shape) != expected_shape:
+            raise ValueError("adapted_logits_matrix must match shift_matrix shape")
+        if self.hidden_state_matrix is not None:
+            if self.hidden_state_matrix.ndim != 2:
+                raise ValueError("hidden_state_matrix must be a 2D tensor when provided")
+            if self.hidden_state_matrix.shape[0] != self.shift_matrix.shape[0]:
+                raise ValueError("hidden_state_matrix rows must match shift_matrix rows")
+        if self.vocabulary_size != int(self.shift_matrix.shape[1]):
+            raise ValueError("vocabulary_size must equal shift_matrix.shape[1]")
+        if len(self.prompt_indices) != self.shift_matrix.shape[0]:
+            raise ValueError("prompt_indices must contain one entry per shift row")
+        if len(self.token_positions) != self.shift_matrix.shape[0]:
+            raise ValueError("token_positions must contain one entry per shift row")
+        if self.continuation_contexts.num_positions != self.shift_matrix.shape[0]:
+            raise ValueError(
+                "continuation_contexts.num_positions must match the logit-shift row count"
+            )
+
     @property
     def num_positions(self) -> int:
         return int(self.shift_matrix.shape[0])
@@ -104,6 +128,20 @@ class ContinuationContextSet:
             "input_ids": [sequence.tolist() for sequence in self.input_ids],
             "num_positions": self.num_positions,
         }
+
+
+def validate_continuation_contexts_for_prompts(
+    contexts: ContinuationContextSet,
+    prompts: list[str],
+    context: str,
+) -> None:
+    """Ensure explicit trajectories can be attributed to exactly the given prompts."""
+    if len(contexts.input_ids) != len(prompts):
+        raise ValueError(
+            f"{context} received {len(contexts.input_ids)} continuation trajectories for "
+            f"{len(prompts)} prompts; explicit contexts must be generated from the same "
+            "ordered prompt set"
+        )
 
 
 @dataclass
@@ -432,6 +470,11 @@ def collect_logit_shift_dataset(
         calibration_prompts,
         max_new_tokens=continuation_tokens,
     )
+    validate_continuation_contexts_for_prompts(
+        contexts,
+        calibration_prompts,
+        context="collect_logit_shift_dataset",
+    )
     base_logits_matrix, hidden_state_matrix, prompt_indices, token_positions = (
         collect_context_model_outputs(
             base,
@@ -513,6 +556,11 @@ def collect_hidden_state_matrix(
         loaded_tokenizer,
         calibration_prompts,
         max_new_tokens=continuation_tokens,
+    )
+    validate_continuation_contexts_for_prompts(
+        contexts,
+        calibration_prompts,
+        context="collect_hidden_state_matrix",
     )
     _, hidden_states, prompt_indices, token_positions = collect_context_model_outputs(
         loaded_model,
@@ -861,6 +909,11 @@ def first_order_logit_shift(
         tokenizer,
         calibration_prompts,
         max_new_tokens=continuation_tokens,
+    )
+    validate_continuation_contexts_for_prompts(
+        contexts,
+        calibration_prompts,
+        context="first_order_logit_shift",
     )
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
