@@ -8,19 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from peft import PeftModel
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    PreTrainedModel,
-    PreTrainedTokenizerBase,
-)
 
-from lora_spec.adapter_props import (
-    compute_adapter_properties,
-    read_adapter_metadata,
-    scale_plain_lora_adapter,
-)
 from lora_spec.artifacts import resolve_artifact_revision
 from lora_spec.design import audit_experiment_design
 from lora_spec.prompts import load_frozen_prompt_texts, prompt_file_provenance
@@ -83,6 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default="results/theory")
     parser.add_argument("--plots-dir", type=str, default="results/theory/plots")
     parser.add_argument("--require-paper-ready-design", action="store_true")
+    parser.add_argument(
+        "--synthetic-smoke-test",
+        action="store_true",
+        help=(
+            "Run a deterministic low-rank synthetic shift through the rank-analysis and "
+            "JSON-writing path without importing Transformers, PEFT, or downloading models."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -92,7 +88,9 @@ def _load_base_model_and_tokenizer(
     torch_dtype: torch.dtype,
     revision: str | None = None,
     device_map: str | None = None,
-) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+) -> tuple[Any, Any]:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision, use_fast=True)
     tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
@@ -110,7 +108,9 @@ def _load_base_model_and_tokenizer(
     return model, tokenizer
 
 
-def _apply_lora_scale(model: PreTrainedModel, scale: float) -> None:
+def _apply_lora_scale(model: Any, scale: float) -> None:
+    from lora_spec.adapter_props import scale_plain_lora_adapter
+
     scale_plain_lora_adapter(model, scale, context="logit-shift rank measurement")
 
 
@@ -140,6 +140,144 @@ def _file_sha256(path: str) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def _run_synthetic_smoke_test(
+    args: argparse.Namespace,
+    config_data: dict[str, Any],
+    seed: int,
+    logger: Any,
+) -> Path:
+    energy_threshold = float(get_config_value(config_data, args, "energy_threshold"))
+    output_dir = str(get_config_value(config_data, args, "output_dir"))
+    plots_dir = ensure_dir(str(get_config_value(config_data, args, "plots_dir")))
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    num_rows = 24
+    vocab_size = 64
+    true_rank = 3
+    left = torch.randn(num_rows, true_rank, generator=generator)
+    right = torch.randn(true_rank, vocab_size, generator=generator)
+    shift_matrix = left @ right
+    shift_matrix = shift_matrix - shift_matrix.mean(dim=-1, keepdim=True)
+
+    analysis = spectral_analysis(shift_matrix)
+    threshold_rank = effective_rank(shift_matrix, threshold=energy_threshold)
+    plot_path = analysis.save_spectrum_plot(
+        plots_dir / "synthetic_smoke__spectrum.png",
+        title="Synthetic low-rank smoke test",
+    )
+    payload = {
+        "experiment_type": "measure_logit_shift_rank",
+        "synthetic_smoke_test": True,
+        "rows": [
+            {
+                "model_pair_name": "synthetic",
+                "adapter_name": "synthetic_rank3",
+                "adapter_rank": true_rank,
+                "adapter_domain": "synthetic",
+                "adapter_epochs": None,
+                "adapter_path": "synthetic",
+                "magnitude_scale": 1.0,
+                "effective_rank": int(threshold_rank),
+                "effective_rank_95": analysis.effective_rank_95,
+                "effective_rank_99": analysis.effective_rank_99,
+                "stable_rank": analysis.stable_rank,
+                "participation_ratio": analysis.participation_ratio,
+                "num_rows": num_rows,
+                "vocab_size": vocab_size,
+                "analysis_dimension": vocab_size,
+                "rank_ceiling": min(num_rows, vocab_size),
+                "effective_rank_fraction_of_ceiling": float(
+                    threshold_rank / max(min(num_rows, vocab_size), 1)
+                ),
+                "rank_ceiling_saturated": False,
+                "calibration_sample_size_sensitivity": {},
+                "sample_size_sensitivity_basis": "synthetic_full_matrix",
+                "rank_estimation_mode": "exact",
+                "spectrum_is_approximate": False,
+                "projection_repetitions": 0,
+                "projection_dimension_sensitivity": {},
+                "effective_rank_estimates": [int(threshold_rank)],
+                "effective_rank_95_estimates": [analysis.effective_rank_95],
+                "effective_rank_99_estimates": [analysis.effective_rank_99],
+                "effective_rank_99_range": [analysis.effective_rank_99, analysis.effective_rank_99],
+                "stable_rank_estimates": [analysis.stable_rank],
+                "stable_rank_range": [analysis.stable_rank, analysis.stable_rank],
+                "participation_ratio_estimates": [analysis.participation_ratio],
+                "participation_ratio_range": [
+                    analysis.participation_ratio,
+                    analysis.participation_ratio,
+                ],
+                "logit_gauge": "row_mean_centered",
+                "spectral_analysis": {
+                    "singular_values": analysis.singular_values,
+                    "cumulative_energy": analysis.cumulative_energy,
+                },
+                "adapter_properties": {
+                    "frobenius_norm_sum": float(torch.linalg.matrix_norm(shift_matrix).item()),
+                    "spectral_norm_sum": float(analysis.singular_values[0]),
+                    "max_spectral_norm": float(analysis.singular_values[0]),
+                    "adapted_parameter_count": true_rank * (num_rows + vocab_size),
+                    "adapted_parameter_fraction": float(true_rank * (num_rows + vocab_size))
+                    / float(num_rows * vocab_size),
+                },
+                "artifact_provenance": {
+                    "base_model": {
+                        "source": "synthetic",
+                        "repository_type": "local",
+                        "requested_revision": None,
+                        "resolved_revision": "synthetic",
+                    },
+                    "adapter": {
+                        "source": "synthetic",
+                        "repository_type": "local",
+                        "requested_revision": None,
+                        "resolved_revision": "synthetic",
+                    },
+                },
+                "continuation_contexts_sha256": "synthetic",
+                "spectrum_plot": str(plot_path),
+                "notes": "MacBook-safe synthetic smoke test",
+                "tags": ["smoke", "synthetic"],
+            }
+        ],
+        "summary": {
+            "num_experiments": 1,
+            "energy_threshold": energy_threshold,
+            "prompts_file": "synthetic",
+            "prompts_provenance": {"source": "synthetic"},
+            "batch_size": 0,
+            "continuation_tokens": 0,
+            "trajectory_policy": "synthetic_low_rank_matrix",
+            "logit_gauge": "row_mean_centered",
+            "design_report": None,
+            "continuation_contexts_sha256_by_experiment": {
+                "synthetic::synthetic_rank3": "synthetic"
+            },
+        },
+    }
+    output = write_json_result(
+        payload=payload,
+        output_dir=output_dir,
+        stem="measure_logit_shift_rank_smoke",
+        config={
+            "synthetic_smoke_test": True,
+            "seed": seed,
+            "num_rows": num_rows,
+            "vocab_size": vocab_size,
+            "true_rank": true_rank,
+            "energy_threshold": energy_threshold,
+        },
+        cwd=Path.cwd(),
+    )
+    logger.info(
+        "Saved synthetic effective-rank smoke test to %s (effective_rank=%d)",
+        output,
+        threshold_rank,
+    )
+    return output
+
+
 def _load_adapted_model(
     base_model_name: str,
     adapter_path: str,
@@ -149,7 +287,10 @@ def _load_adapted_model(
     base_revision: str | None = None,
     adapter_revision: str | None = None,
     device_map: str | None = None,
-) -> PreTrainedModel:
+) -> Any:
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
         revision=base_revision,
@@ -174,8 +315,8 @@ def _load_adapted_model(
 
 @torch.inference_mode()
 def _collect_model_logit_rows(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizerBase,
+    model: Any,
+    tokenizer: Any,
     contexts: ContinuationContextSet,
     batch_size: int,
 ) -> torch.Tensor:
@@ -206,8 +347,8 @@ def _collect_model_logit_rows(
 
 @torch.inference_mode()
 def _collect_projected_logit_rows(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizerBase,
+    model: Any,
+    tokenizer: Any,
     contexts: ContinuationContextSet,
     batch_size: int,
     projection: torch.Tensor,
@@ -306,6 +447,9 @@ def main() -> None:
     config_data = resolve_config(args.config, args.override)
     seed = int(get_config_value(config_data, args, "seed"))
     set_seed(seed)
+    if args.synthetic_smoke_test:
+        _run_synthetic_smoke_test(args, config_data, seed, logger)
+        return
 
     models_config = str(get_config_value(config_data, args, "models_config"))
     adapters_config = str(get_config_value(config_data, args, "adapters_config"))
@@ -481,6 +625,8 @@ def main() -> None:
                 contexts=contexts,
                 batch_size=batch_size,
             )
+        from lora_spec.adapter_props import compute_adapter_properties, read_adapter_metadata
+
         properties = compute_adapter_properties(
             adapter_path,
             base_model=base_model,
