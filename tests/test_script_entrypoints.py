@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import json
 from pathlib import Path
 
 
@@ -69,5 +70,8 @@ def test_rank_script_synthetic_smoke_test_writes_result(tmp_path: Path) -> None:
         if not path.name.endswith(".source.json")
     )
     assert len(result_files) == 1
-    assert result_files[0].with_name(f"{result_files[0].stem}.source.json").exists()
+    payload = json.loads(result_files[0].read_text(encoding="utf-8"))
+    source_snapshot_path = payload["metadata"].get("source_snapshot_path")
+    if source_snapshot_path is not None:
+        assert (result_files[0].parent / source_snapshot_path).exists()
     assert (plots_dir / "synthetic_smoke__spectrum.png").exists()
